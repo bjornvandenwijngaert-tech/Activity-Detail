@@ -1,10 +1,10 @@
 {
   "name": "Vehicle Activity Log",
   "supportEmail": "bjornvandenwijngaert@geotabsmb.com",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "items": [
     {
-      "url": "https://bjornvandenwijngaert-tech.github.io/smart-insights/vehicle-activity-log/index.html",
+      "url": "https://bjornvandenwijngaert-tech.github.io/Activity-Detail/index.html",
       "path": "ActivityLink/",
       "menuName": {
         "en": "Vehicle Activity Log"

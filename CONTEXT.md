@@ -97,7 +97,8 @@ Per device:
 - **Distance is GPS-derived**, so a day total can drift slightly from Geotab's
   odometer-based `Trip.Distance`. If the customer needs the two to agree, scale
   the day's haversine total to the summed `Trip.Distance` for that day.
-- **Replay links are unverified.** See below.
+- **Replay links** use the documented URL format but have not been clicked in a
+  live database since the v1.0.1 fix. See below.
 - **Fallback when there is no ignition data.** If a vehicle returns no ignition
   records, the engine treats the ignition as on for the whole range and derives
   idling from GPS speed alone. A visible warning says so, because those totals
@@ -105,27 +106,39 @@ Per device:
 
 ## Replay link
 
-Trips History selects a vehicle and a date window, not an instant, so the best
-achievable result is the moment bracketed in a narrow window. The link uses the
-row timestamp plus or minus five minutes.
+The URL format is documented in the Geotab SDK guide
+[Using MyGeotab URLs](https://developers.geotab.com/myGeotab/guides/myGeotabUrls/):
 
-Two mechanisms, tried in order:
+```
+https://<server>/<db>/#tripsHistory,dateRange:(interval:custom,startDate:'…Z',endDate:'…Z'),entityType:Device,selectedEntities:!(b1,b7,b21)
+```
 
-1. `state.gotoPage("tripsHistory", { dateRange, entityType, selectedEntities })`.
-   `tripsHistory` is a documented navigation target but Geotab does not document
-   its parameter names, so these are a best guess.
-2. A hand-built fragment URL:
-   `https://<server>/<db>/#tripsHistory,dateRange:(interval:custom,startDate:'…Z',endDate:'…Z'),entityType:Device,selectedEntities:!((id:<deviceId>))`
+`selectedEntities` takes **bare device ids** in a rison list. v1.0.0 wrapped them
+as `!((id:b12))`, which parses without erroring but selects no vehicle, so the
+page opened blank. Fixed in v1.0.1.
 
-The MyGeotab host comes from `api.getSession`, not `window.location`, because
-the add-in is hosted off-domain on GitHub Pages.
+The second reason v1.0.0 looked empty: Trips History lists **trips over a range**,
+not the vehicle's state at an instant. A few minutes either side of one GPS fix
+can contain no whole trip, so the page has nothing to draw. The range is now the
+row's **full local day**, which always lands on that vehicle's trip list for that
+date with the trip containing the moment visible in it. Set `REPLAY_WHOLE_DAY` to
+`false` in `app.js` to switch back to a narrow window (`REPLAY_PAD_MS`, 15 min).
 
-**To confirm the parameter names:** open Trips History manually in a database,
-select one vehicle and a custom range, and read the resulting URL fragment. Each
-row's REPLAY link exposes the URL it would use in its `title` attribute, so you
-can hover a row and compare. If neither mechanism lands correctly, replace the
-link with an inline panel showing coordinates and a copy button rather than
-shipping a link that goes to the wrong place.
+There is no documented MyGeotab page that scopes to an instant. `map` takes
+`liveVehicleIds`, `planRoutes` and `highlightGroup` only, all of which are live
+rather than historical, so `tripsHistory` is the closest available target.
+
+The documented URL is the primary route and opens in a new tab.
+`state.gotoPage("tripsHistory", …)` is only the fallback for when the session
+does not hand back a server or database name, because gotoPage's parameter shape
+is not documented anywhere. If the session gives no server, the report says so in
+a notice at run time rather than leaving dead links unexplained.
+
+The MyGeotab host comes from `api.getSession`, not `window.location`, because the
+add-in is hosted off-domain on GitHub Pages.
+
+Every REPLAY link carries the URL it will open in its `title` attribute, so
+hovering a row shows exactly where it goes before you click.
 
 ## Volume guards
 
@@ -166,18 +179,23 @@ group-wide run shows output while it is still working.
 
 ## Hosting
 
-Not yet published. `config.json` points at
-`https://bjornvandenwijngaert-tech.github.io/smart-insights/vehicle-activity-log/index.html`,
-which is the Smart Insights GitHub Pages site. That is the same arrangement
-legacy-trip-report was designed for.
+Published to its own GitHub Pages site, separate from Smart Insights:
 
-Outstanding before a demo:
+`https://bjornvandenwijngaert-tech.github.io/Activity-Detail/index.html`
+
+That is the URL in `config.json`. `index.html` and the whole `src/` folder are
+served from the repository root, so the relative paths in `index.html` work
+unchanged.
+
+Cache note: the asset links are versioned with `?v=1.0.0`. Bump that query
+string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
+otherwise MyGeotab will keep serving the cached copy.
+
+Still outstanding, unrelated to this add-in:
 
 - `~/repos/legacy-trip-report` is not a git repository, so it has no route to
   publication, and its files show as deleted (unstaged) in the `smart-insights`
   working tree.
-- Smart Insights pushes with `git push origin master:main` (local branch is
-  `master`, remote default is `main`).
 
 ## Later
 

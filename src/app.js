@@ -428,15 +428,35 @@
   }
 
   // ─── Replay link ─────────────────────────────────────────────────────────
-  // Trips History selects a vehicle and a date window, not an instant, so the
-  // best available result is the moment bracketed in a narrow window.
-  var REPLAY_PAD_MS = 5 * 60 * 1000;
+  // Documented format (Geotab SDK, "Using MyGeotab URLs"):
+  //
+  //   #tripsHistory,dateRange:(interval:custom,startDate:'…Z',endDate:'…Z'),
+  //   entityType:Device,selectedEntities:!(b1,b7,b21)
+  //
+  // Two things matter and both were wrong in v1.0.0:
+  //   1. selectedEntities takes BARE device ids in a rison list, !(b12).
+  //      Wrapping them as !((id:b12)) parses but selects no vehicle, so the
+  //      page opens empty.
+  //   2. Trips History lists trips over a range, not the state at an instant.
+  //      A few minutes either side of one GPS fix can contain no whole trip and
+  //      come back blank, so the range is the row's full local day. That always
+  //      lands on the vehicle's trip list for that date with the trip containing
+  //      the moment visible in it.
+  //
+  // Set REPLAY_WHOLE_DAY to false to switch to a narrow window instead.
+  var REPLAY_WHOLE_DAY = true;
+  var REPLAY_PAD_MS    = 15 * 60 * 1000;
 
   function replayWindow(iso) {
-    var ms = new Date(iso).getTime();
+    var d = new Date(iso);
+    if (REPLAY_WHOLE_DAY) {
+      var s = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+      var e = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+      return { start: s.toISOString(), end: e.toISOString() };
+    }
     return {
-      start: new Date(ms - REPLAY_PAD_MS).toISOString(),
-      end:   new Date(ms + REPLAY_PAD_MS).toISOString()
+      start: new Date(d.getTime() - REPLAY_PAD_MS).toISOString(),
+      end:   new Date(d.getTime() + REPLAY_PAD_MS).toISOString()
     };
   }
 
@@ -445,26 +465,31 @@
     var w = replayWindow(iso);
     return "https://" + S.server + "/" + S.dbName + "/#tripsHistory,"
       + "dateRange:(interval:custom,startDate:'" + w.start + "',endDate:'" + w.end + "'),"
-      + "entityType:Device,selectedEntities:!((id:" + deviceId + "))";
+      + "entityType:Device,"
+      + "selectedEntities:!(" + deviceId + ")";
   }
 
-  // Try the supported in-app navigation first; fall back to the fragment URL.
+  // The URL format above is documented; gotoPage's parameter shape is not, so
+  // the URL is the primary route and gotoPage is only the fallback for when the
+  // session did not hand back a server or database name.
   function openReplay(deviceId, iso) {
-    var w = replayWindow(iso);
+    var url = replayUrl(deviceId, iso);
+    if (url) { window.open(url, "_blank"); return; }
+
     if (S.gState && typeof S.gState.gotoPage === "function") {
+      var w = replayWindow(iso);
       try {
         S.gState.gotoPage("tripsHistory", {
-          dateRange: { startDate: w.start, endDate: w.end },
+          dateRange: { interval: "custom", startDate: w.start, endDate: w.end },
           entityType: "Device",
-          selectedEntities: [{ id: deviceId }]
+          selectedEntities: [deviceId]
         });
         return;
       } catch (e) {
-        console.warn("[VehicleActivityLog] gotoPage failed, falling back to URL", e);
+        console.warn("[VehicleActivityLog] gotoPage failed", e);
       }
     }
-    var url = replayUrl(deviceId, iso);
-    if (url) window.open(url, "_blank");
+    alert("Could not work out the MyGeotab address for this database, so the Replay link cannot be built.");
   }
 
   // ─── Rendering ───────────────────────────────────────────────────────────
@@ -687,6 +712,9 @@
     S.devices = [];
     S.warnings = [];
     S.addrMap = {};
+    if (!S.server || !S.dbName) {
+      addWarning("The MyGeotab address for this database could not be read from the session, so the Replay links will not work. Everything else in the report is unaffected.");
+    }
     renderWarnings();
     $("val-summary").classList.add("hidden");
     $("val-csv").classList.add("hidden");
