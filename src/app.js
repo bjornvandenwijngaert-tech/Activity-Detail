@@ -225,6 +225,43 @@
     }, function (recs) { cb(recs || []); }, function () { cb(null); });
   }
 
+  // Trips are fetched only to build Replay links. The Trips History page keys
+  // its replay off a trip's exact start and stop, so a row can only deep-link
+  // into the replay if we know which trip contains it. One extra Get per
+  // vehicle; the report itself does not use this data.
+  function fetchTrips(deviceId, fromIso, toIso, cb) {
+    apiCall("Get", {
+      typeName: "Trip",
+      search: { fromDate: fromIso, toDate: toIso, deviceSearch: { id: deviceId } }
+    }, function (trips) {
+      var out = (trips || []).filter(function (t) { return t.start && t.stop; }).map(function (t) {
+        return {
+          startIso: t.start,
+          stopIso:  t.stop,
+          startMs:  new Date(t.start).getTime(),
+          stopMs:   new Date(t.stop).getTime(),
+          // Trip.driver is a Driver entity, or the "UnknownDriverId" sentinel
+          // when nobody was assigned. The card id in the URL needs whichever.
+          driverId: (t.driver && t.driver.id) ? t.driver.id : "UnknownDriverId"
+        };
+      });
+      out.sort(function (a, b) { return a.startMs - b.startMs; });
+      cb(out);
+    }, function () { cb([]); });
+  }
+
+  // Trips are sorted and do not overlap, so a binary search is enough.
+  function tripAt(trips, ms) {
+    var lo = 0, hi = trips.length - 1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (ms < trips[mid].startMs)      hi = mid - 1;
+      else if (ms > trips[mid].stopMs)  lo = mid + 1;
+      else return trips[mid];
+    }
+    return null;
+  }
+
   // ─── Status engine ───────────────────────────────────────────────────────
   // Returns [{ dayKey, rows, distKm, idleMins }] for one device.
   function buildActivity(logs, ignitionRecs, fromIso, toIso) {
@@ -429,36 +466,68 @@
   }
 
   // ─── Replay link ─────────────────────────────────────────────────────────
-  // Documented format (Geotab SDK, "Using MyGeotab URLs"):
+  // The format in the SDK guide ("Using MyGeotab URLs") is stale: its examples
+  // date from 2015 and Geotab simplified the URLs in 2022. entityType and
+  // selectedEntities are no longer read by the Trips History page, which is why
+  // v1.0.0 to v1.0.2 all opened a blank page.
   //
-  //   #tripsHistory,dateRange:(interval:custom,startDate:'…Z',endDate:'…Z'),
-  //   entityType:Device,selectedEntities:!(b1,b7,b21)
+  // This is a real URL copied out of the address bar of a live database:
   //
-  // Two things matter and both were wrong in v1.0.0:
-  //   1. selectedEntities takes BARE device ids in a rison list, !(b12).
-  //      Wrapping them as !((id:b12)) parses but selects no vehicle, so the
-  //      page opens empty.
-  //   2. Trips History lists trips over a range, not the state at an instant.
-  //      A few minutes either side of one GPS fix can contain no whole trip and
-  //      come back blank, so the range is the row's full local day. That always
-  //      lands on the vehicle's trip list for that date with the trip containing
-  //      the moment visible in it.
+  //   #tripsHistory,
+  //   dateRange:(endDate:'2026-08-19T22:59:59.000Z',label:Today,startDate:'2026-08-18T23:00:00.000Z'),
+  //   expandedCardIds:!('b11_UnknownDriverId_Tue+Aug+18'),
+  //   isReplayPlayerHidden:!f,
+  //   mapBounds:!(42.62073,2.82396,37.62609,-4.1194),
+  //   routes:(b11:!((start:'2026-08-18T21:14:40.557Z',stop:'2026-08-18T23:38:26.557Z')))
   //
-  // Set REPLAY_WHOLE_DAY to false to switch to a narrow window instead.
-  var REPLAY_WHOLE_DAY = true;
-  var REPLAY_PAD_MS    = 15 * 60 * 1000;
+  // What each part does:
+  //   routes                a map of device id to trip segments. This is what
+  //                         picks the vehicle AND draws the segment. It replaces
+  //                         entityType and selectedEntities entirely.
+  //   isReplayPlayerHidden  rison !f is false, so the replay player opens.
+  //                         Without it the page shows a static route.
+  //   dateRange             scopes the trip list. label is a UI convenience and
+  //                         is omitted here, since explicit dates are given.
+  //   expandedCardIds       opens the matching trip card in the side list.
+  //                         "<deviceId>_<driverId>_<Ddd+Mmm+D>", spaces as "+".
+  //   mapBounds             viewport only; omitted so the map fits the route.
+  //
+  // Segment boundaries come from the Trip containing the row's timestamp. For a
+  // row with no trip (idling with the ignition on between trips, for example)
+  // the window falls back to the timestamp plus or minus 15 minutes.
+  var REPLAY_PAD_MS = 15 * 60 * 1000;
 
-  function replayWindow(iso) {
+  var DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  var MON_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  function cardDatePart(iso) {
     var d = new Date(iso);
-    if (REPLAY_WHOLE_DAY) {
-      var s = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
-      var e = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
-      return { start: s.toISOString(), end: e.toISOString() };
+    return DOW_SHORT[d.getDay()] + "+" + MON_SHORT[d.getMonth()] + "+" + d.getDate();
+  }
+
+  function replayUrl(deviceId, iso, trip) {
+    if (!S.server || !S.dbName) return "";
+
+    var d = new Date(iso);
+    var dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+    var dayEnd   = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 0);
+
+    var segStart, segStop, cardId = "";
+    if (trip) {
+      segStart = trip.startIso;
+      segStop  = trip.stopIso;
+      cardId   = deviceId + "_" + trip.driverId + "_" + cardDatePart(trip.startIso);
+    } else {
+      segStart = new Date(d.getTime() - REPLAY_PAD_MS).toISOString();
+      segStop  = new Date(d.getTime() + REPLAY_PAD_MS).toISOString();
     }
-    return {
-      start: new Date(d.getTime() - REPLAY_PAD_MS).toISOString(),
-      end:   new Date(d.getTime() + REPLAY_PAD_MS).toISOString()
-    };
+
+    var url = "https://" + S.server + "/" + S.dbName + "/#tripsHistory,"
+      + "dateRange:(endDate:'" + dayEnd.toISOString() + "',startDate:'" + dayStart.toISOString() + "'),";
+    if (cardId) url += "expandedCardIds:!('" + cardId + "'),";
+    url += "isReplayPlayerHidden:!f,"
+      + "routes:(" + deviceId + ":!((start:'" + segStart + "',stop:'" + segStop + "')))";
+    return url;
   }
 
   // Where the MyGeotab host comes from, best source first.
@@ -503,35 +572,11 @@
     }
   }
 
-  function replayUrl(deviceId, iso) {
-    if (!S.server || !S.dbName) return "";
-    var w = replayWindow(iso);
-    return "https://" + S.server + "/" + S.dbName + "/#tripsHistory,"
-      + "dateRange:(interval:custom,startDate:'" + w.start + "',endDate:'" + w.end + "'),"
-      + "entityType:Device,"
-      + "selectedEntities:!(" + deviceId + ")";
-  }
-
-  // The URL format above is documented; gotoPage's parameter shape is not, so
-  // the URL is the primary route and gotoPage is only the fallback for when the
-  // session did not hand back a server or database name.
-  function openReplay(deviceId, iso) {
-    var url = replayUrl(deviceId, iso);
-    if (url) { window.open(url, "_blank"); return; }
-
-    if (S.gState && typeof S.gState.gotoPage === "function") {
-      var w = replayWindow(iso);
-      try {
-        S.gState.gotoPage("tripsHistory", {
-          dateRange: { interval: "custom", startDate: w.start, endDate: w.end },
-          entityType: "Device",
-          selectedEntities: [deviceId]
-        });
-        return;
-      } catch (e) {
-        console.warn("[VehicleActivityLog] gotoPage failed", e);
-      }
-    }
+  // Only reached when no host resolved, so no URL could be built at all. The
+  // previous gotoPage fallback passed entityType and selectedEntities, which the
+  // page no longer reads, so it landed on an empty Trips History and looked like
+  // a broken link rather than a missing host. Say so instead.
+  function openReplay() {
     alert("Could not work out the MyGeotab address for this database, so the Replay link cannot be built.");
   }
 
@@ -560,7 +605,7 @@
         var speedCell = r.speed == null || r.speed < IDLE_SPEED_KMH
           ? "<span class='val-muted'>--</span>"
           : Math.round(r.speed) + " km/h";
-        var url = replayUrl(dev.id, r.t);
+        var url = replayUrl(dev.id, r.t, r.trip);
         body += "<tr>"
           + "<td class='val-num'>" + dateCell + "</td>"
           + "<td><span class='val-status'><span class='val-dot val-dot-" + r.cls + "'></span>" + esc(r.status) + "</span></td>"
@@ -811,13 +856,24 @@
             if (!built.days.length) { next(); return; }
 
             var entry = { id: dev.id, name: dev.name, days: built.days };
-            setProgress("Resolving addresses for " + dev.name + "...");
-            resolveAddresses(built.days, function (done, total) {
-              setProgress("Resolving addresses for " + dev.name + " (" + done + " of " + total + ")...");
-            }, function () {
-              S.devices.push(entry);
-              renderDevice(entry);
-              next();
+
+            // Attach the containing trip to every row, so the Replay link can
+            // carry that trip's exact start and stop.
+            fetchTrips(dev.id, fromIso, toIso, function (trips) {
+              if (trips.length) {
+                built.days.forEach(function (day) {
+                  day.rows.forEach(function (r) { r.trip = tripAt(trips, new Date(r.t).getTime()); });
+                });
+              }
+
+              setProgress("Resolving addresses for " + dev.name + "...");
+              resolveAddresses(built.days, function (done, total) {
+                setProgress("Resolving addresses for " + dev.name + " (" + done + " of " + total + ")...");
+              }, function () {
+                S.devices.push(entry);
+                renderDevice(entry);
+                next();
+              });
             });
           });
         });

@@ -97,8 +97,8 @@ Per device:
 - **Distance is GPS-derived**, so a day total can drift slightly from Geotab's
   odometer-based `Trip.Distance`. If the customer needs the two to agree, scale
   the day's haversine total to the summed `Trip.Distance` for that day.
-- **Replay links** use the documented URL format but have not been clicked in a
-  live database since the v1.0.1 fix. See below.
+- **Replay links** were rewritten in v1.1.0 against a real URL rather than the
+  documentation, and have not been clicked in a live database since. See below.
 - **Fallback when there is no ignition data.** If a vehicle returns no ignition
   records, the engine treats the ignition as on for the whole range and derives
   idling from GPS speed alone. A visible warning says so, because those totals
@@ -106,33 +106,52 @@ Per device:
 
 ## Replay link
 
-The URL format is documented in the Geotab SDK guide
-[Using MyGeotab URLs](https://developers.geotab.com/myGeotab/guides/myGeotabUrls/):
+**The SDK documentation for this is wrong.** The examples in
+[Using MyGeotab URLs](https://developers.geotab.com/myGeotab/guides/myGeotabUrls/)
+date from 2015, and Geotab simplified MyGeotab URLs in 2022. `entityType` and
+`selectedEntities` are no longer read by the Trips History page. Every version
+from v1.0.0 to v1.0.2 sent them and opened a blank page.
+
+v1.1.0 uses the real grammar, taken from a URL copied out of the address bar of a
+live database:
 
 ```
-https://<server>/<db>/#tripsHistory,dateRange:(interval:custom,startDate:'…Z',endDate:'…Z'),entityType:Device,selectedEntities:!(b1,b7,b21)
+#tripsHistory,
+dateRange:(endDate:'2026-08-19T22:59:59.000Z',label:Today,startDate:'2026-08-18T23:00:00.000Z'),
+expandedCardIds:!('b11_UnknownDriverId_Tue+Aug+18'),
+isReplayPlayerHidden:!f,
+mapBounds:!(42.62073,2.82396,37.62609,-4.1194),
+routes:(b11:!((start:'2026-08-18T21:14:40.557Z',stop:'2026-08-18T23:38:26.557Z')))
 ```
 
-`selectedEntities` takes **bare device ids** in a rison list. v1.0.0 wrapped them
-as `!((id:b12))`, which parses without erroring but selects no vehicle, so the
-page opened blank. Fixed in v1.0.1.
+| Parameter | What it does | Generated? |
+|---|---|---|
+| `routes` | Map of device id to trip segments. Picks the vehicle **and** draws the segment. Replaces `entityType` + `selectedEntities` entirely. | Yes |
+| `isReplayPlayerHidden:!f` | Rison `!f` is false, so the replay player opens. Without it the page draws a static route. | Yes |
+| `dateRange` | Scopes the trip list. `label` is a UI convenience, omitted since explicit dates are supplied. | Yes, row's local day |
+| `expandedCardIds` | Opens the matching trip card in the side list. `<deviceId>_<driverId>_<Ddd+Mmm+D>`, spaces as `+`. | Yes, when a trip matched |
+| `mapBounds` | Viewport only. | No, so the map fits the route |
 
-The second reason v1.0.0 looked empty: Trips History lists **trips over a range**,
-not the vehicle's state at an instant. A few minutes either side of one GPS fix
-can contain no whole trip, so the page has nothing to draw. The range is now the
-row's **full local day**, which always lands on that vehicle's trip list for that
-date with the trip containing the moment visible in it. Set `REPLAY_WHOLE_DAY` to
-`false` in `app.js` to switch back to a narrow window (`REPLAY_PAD_MS`, 15 min).
+### Why Trip is now fetched
 
-There is no documented MyGeotab page that scopes to an instant. `map` takes
-`liveVehicleIds`, `planRoutes` and `highlightGroup` only, all of which are live
-rather than historical, so `tripsHistory` is the closest available target.
+`routes` needs a segment's exact start and stop. A row carries a single
+timestamp, so v1.1.0 adds one `Get` on `Trip` per vehicle and binary-searches for
+the trip containing each row's timestamp. That data is used **only** for the
+Replay link; nothing in the report body depends on it.
 
-The documented URL is the primary route and opens in a new tab.
-`state.gotoPage("tripsHistory", …)` is only the fallback for when the session
-does not hand back a server or database name, because gotoPage's parameter shape
-is not documented anywhere. If the session gives no server, the report says so in
-a notice at run time rather than leaving dead links unexplained.
+Rows with no containing trip (idling with the ignition on between trips) fall
+back to the timestamp plus or minus 15 minutes (`REPLAY_PAD_MS`). Whether the
+page accepts an arbitrary window rather than real trip boundaries is untested.
+
+### Unverified in this format
+
+- **`expandedCardIds` day number is not zero-padded** (`Aug+8`, not `Aug+08`).
+  The one real sample has a two-digit day so it does not settle the question. If
+  it is wrong the card just does not expand; the route and replay still work.
+- **`label` is omitted.** The real sample always carries one (`label:Today`). If
+  the date range misbehaves, try `label:Custom`.
+- **The card date uses browser local time**, so it inherits the timezone bug
+  below. Same low blast radius: a wrong card id means an unexpanded card.
 
 ### Where the host comes from (v1.0.2)
 
@@ -164,12 +183,23 @@ affected.
 
 ### If it is still wrong
 
-The URL grammar above is from the SDK guide, whose examples date from 2015, and
-Geotab published a "simplification of MyGeotab URLs" notice in June 2022 that is
-behind a Community login. The grammar may have moved. The definitive fix is to
-open Trips History in a real database, select one vehicle and a custom range, and
-copy the URL out of the address bar. Whatever that produces is the format to
-generate, and it takes precedence over the documentation.
+Copy a working URL out of the address bar of a real database again and diff it
+against what the report generates. That beats the documentation every time, which
+is how v1.1.0 was arrived at.
+
+## Timezone (known bug, not yet fixed)
+
+Days are bucketed by the **browser's** timezone, not the MyGeotab user's
+`timeZoneId`. The two differ whenever the operator is not in the database's own
+timezone, and the failure is silent: wrong day boundaries and a daily distance
+that resets at the wrong moment.
+
+This is live, not theoretical. The real Trips History URL for a UK database shows
+`startDate:'2026-08-18T23:00:00.000Z'` for "Today", so that database is on UTC+1
+while the browser running the report is on UTC+2.
+
+The fix is to read `timeZoneId` from the session user and bucket against it
+rather than against `Date.getFullYear()` / `getMonth()` / `getDate()`.
 
 ## Volume guards
 
@@ -218,7 +248,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.0.0`. Bump that query
+Cache note: the asset links are versioned with `?v=1.1.0`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 
