@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vehicle Activity Log</title>
+  <link rel="stylesheet" href="src/styles.css?v=1.0.0" />
+  <link rel="stylesheet" href="src/activity.css?v=1.0.0" />
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
+</head>
+<body>
+  <div id="app">
+
+    <!-- Header -->
+    <header class="header">
+      <div class="header-brand">
+        <svg class="header-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/>
+          <polyline points="12 7 12 12 15.5 14"/>
+        </svg>
+        <span class="header-title">Vehicle <span>Activity Log</span></span>
+      </div>
+      <div class="header-meta">
+        <span id="val-db" class="db-badge"></span>
+        <span class="version-badge">v1.0.0</span>
+      </div>
+    </header>
+
+    <!-- Loading state -->
+    <div id="val-loading" class="loading-screen">
+      <div class="spinner"></div>
+      <p>Connecting to MyGeotab...</p>
+    </div>
+
+    <!-- Main content -->
+    <main id="val-main" class="main hidden">
+      <section class="tab active">
+
+        <div class="tab-toolbar">
+          <h2 class="tab-title">Vehicle Activity Log</h2>
+          <div class="report-filters">
+            <select id="val-group" class="select" style="min-width:160px">
+              <option value="">All groups</option>
+            </select>
+            <select id="val-vehicle" class="select" style="min-width:180px">
+              <option value="">All vehicles in group</option>
+            </select>
+            <input type="date" id="val-from" class="input-date" />
+            <input type="date" id="val-to" class="input-date" />
+            <button id="val-run" class="btn btn-primary">Run</button>
+            <button id="val-csv" class="btn btn-secondary hidden">Export CSV</button>
+            <button id="val-pdf" class="btn btn-secondary hidden">Export PDF</button>
+          </div>
+        </div>
+
+        <div id="val-notice" class="val-notice hidden"></div>
+        <div id="val-summary" class="report-summary hidden"></div>
+        <div id="val-output" class="report-output">
+          <p class="report-placeholder">Pick a group, vehicle and date range, then click Run.</p>
+        </div>
+
+      </section>
+    </main>
+
+  </div>
+
+  <script src="src/logo-data.js?v=1.0.0"></script>
+  <script src="src/app.js?v=1.0.0"></script>
+</body>
+</html>
