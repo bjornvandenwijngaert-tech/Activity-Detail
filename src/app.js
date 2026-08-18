@@ -35,6 +35,7 @@
     gState:     null,   // the MyGeotab state object (gotoPage lives here)
     dbName:     "",
     server:     "",
+    hostVia:    "",   // which source the server name came from, shown on screen
     addrMap:    {},     // "lat,lng" -> resolved address
     devices:    [],     // [{ id, name, days: [{ dayKey, rows, distKm, idleMins }] }]
     warnings:   [],
@@ -460,6 +461,48 @@
     };
   }
 
+  // Where the MyGeotab host comes from, best source first.
+  //
+  // Add-in pages are injected into the MyGeotab page rather than iframed, so
+  // window.location is normally already the real MyGeotab URL:
+  //   https://my.geotab.com/<database>/#ActivityLink/...
+  // That is more reliable than api.getSession, which in v1.0.1 was the only
+  // source and evidently came back without a server on this database. When it
+  // does, replayUrl returned "" and the click fell through to the undocumented
+  // gotoPage path, landing on Trips History with nothing selected.
+  function resolveHost() {
+    var found = { server: S.server, db: S.dbName, via: S.hostVia };
+
+    if (!found.server) {
+      var host = window.location.hostname || "";
+      // Ignore the case where the page really is being served from its own host.
+      if (host && !/(^|\.)github\.io$/i.test(host) && host !== "localhost" && host !== "127.0.0.1") {
+        found.server = host;
+        found.via = "window.location";
+        var seg = window.location.pathname.split("/").filter(Boolean);
+        if (!found.db && seg.length) found.db = decodeURIComponent(seg[0]);
+      }
+    }
+
+    S.server  = found.server || "";
+    S.dbName  = found.db || "";
+    S.hostVia = found.via || "";
+    return S.server && S.dbName;
+  }
+
+  function renderLinkInfo() {
+    var el = $("val-linkinfo");
+    if (!el) return;
+    if (S.server && S.dbName) {
+      el.innerHTML = "Replay links open <code>" + esc(S.server + "/" + S.dbName)
+        + "</code> <span class='val-muted'>(host read from " + esc(S.hostVia || "session") + ")</span>";
+      el.classList.remove("hidden");
+    } else {
+      el.innerHTML = "Replay links are disabled: could not work out the MyGeotab server or database name for this page.";
+      el.classList.remove("hidden");
+    }
+  }
+
   function replayUrl(deviceId, iso) {
     if (!S.server || !S.dbName) return "";
     var w = replayWindow(iso);
@@ -526,7 +569,12 @@
           + "<td class='val-num'>" + speedCell + "</td>"
           + "<td>" + esc(addressFor(r)) + "</td>"
           + "<td class='val-coords'>" + r.lat.toFixed(5) + ", " + r.lng.toFixed(5) + "</td>"
-          + "<td><a href='#' class='val-replay' data-device='" + esc(dev.id) + "' data-time='" + esc(r.t) + "' title='" + esc(url) + "'>REPLAY</a></td>"
+          // A real href, not "#": the browser status bar then shows where the
+          // link goes, and middle-click / copy-link-address both work, which is
+          // what makes this diagnosable without a debugger.
+          + "<td><a href='" + esc(url || "#") + "' target='_blank' rel='noopener' class='val-replay'"
+          + " data-device='" + esc(dev.id) + "' data-time='" + esc(r.t) + "'"
+          + " title='" + esc(url || "No MyGeotab host resolved, so no Replay link could be built.") + "'>REPLAY</a></td>"
           + "</tr>";
       });
 
@@ -543,9 +591,12 @@
 
     block.innerHTML = html;
 
+    // The anchor navigates on its own when it has a real href. Only step in
+    // when there is none, so the fallback still has somewhere to go.
     block.addEventListener("click", function (ev) {
       var a = ev.target.closest ? ev.target.closest("a.val-replay") : null;
       if (!a) return;
+      if (a.getAttribute("href") !== "#") return;
       ev.preventDefault();
       openReplay(a.getAttribute("data-device"), a.getAttribute("data-time"));
     });
@@ -712,9 +763,10 @@
     S.devices = [];
     S.warnings = [];
     S.addrMap = {};
-    if (!S.server || !S.dbName) {
-      addWarning("The MyGeotab address for this database could not be read from the session, so the Replay links will not work. Everything else in the report is unaffected.");
+    if (!resolveHost()) {
+      addWarning("The MyGeotab server or database name could not be worked out for this page, so the Replay links will not work. Everything else in the report is unaffected.");
     }
+    renderLinkInfo();
     renderWarnings();
     $("val-summary").classList.add("hidden");
     $("val-csv").classList.add("hidden");
@@ -811,18 +863,25 @@
             S.dbName = freshState.database;
             $("val-db").textContent = freshState.database;
           }
-          // The add-in is hosted off-domain, so the MyGeotab host for Replay
-          // links has to come from the session rather than window.location.
+          // getSession is one source for the MyGeotab host and not the best
+          // one, so take whatever it gives and let resolveHost fill the gaps.
           if (api && typeof api.getSession === "function") {
             api.getSession(function (session, server) {
-              if (server) S.server = String(server).replace(/^https?:\/\//, "").replace(/\/$/, "");
+              if (server) {
+                S.server = String(server).replace(/^https?:\/\//, "").replace(/\/$/, "");
+                S.hostVia = "api.getSession";
+              }
               if (!S.dbName && session && session.database) {
                 S.dbName = session.database;
                 $("val-db").textContent = session.database;
               }
+              resolveHost();
+              renderLinkInfo();
             });
           }
           setup();
+          resolveHost();
+          renderLinkInfo();
           $("val-loading").classList.add("hidden");
           $("val-main").classList.remove("hidden");
         } catch (err) {

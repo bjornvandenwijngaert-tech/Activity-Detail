@@ -134,11 +134,42 @@ does not hand back a server or database name, because gotoPage's parameter shape
 is not documented anywhere. If the session gives no server, the report says so in
 a notice at run time rather than leaving dead links unexplained.
 
-The MyGeotab host comes from `api.getSession`, not `window.location`, because the
-add-in is hosted off-domain on GitHub Pages.
+### Where the host comes from (v1.0.2)
 
-Every REPLAY link carries the URL it will open in its `title` attribute, so
-hovering a row shows exactly where it goes before you click.
+v1.0.1 read the server from `api.getSession` alone, on the assumption that a page
+served from GitHub Pages could not see the MyGeotab URL. That assumption was
+wrong. Add-in pages are **injected into the MyGeotab page, not iframed**, so the
+executing document is on the MyGeotab origin and `window.location` already holds
+both the server and the database:
+
+```
+https://my.geotab.com/<database>/#ActivityLink/...
+```
+
+`resolveHost()` now takes `window.location` first (ignoring `*.github.io` and
+localhost, for the case where the page really is served standalone) and falls
+back to `getSession`. If `getSession` returns no server, as it appears to on at
+least one database, v1.0.1 built an empty URL and the click fell through to the
+undocumented `gotoPage` path, which lands on Trips History with nothing selected.
+That is the most likely cause of the original "opens but shows nothing".
+
+### Diagnostics
+
+The report shows a strip above the results saying exactly which host and database
+the Replay links point at and which source that came from. Every REPLAY link now
+has a **real `href`** rather than `#`, so the browser status bar shows the
+destination on hover, and copy-link-address and middle-click both work. If no
+host resolves, the strip says so and a notice explains that only Replay is
+affected.
+
+### If it is still wrong
+
+The URL grammar above is from the SDK guide, whose examples date from 2015, and
+Geotab published a "simplification of MyGeotab URLs" notice in June 2022 that is
+behind a Community login. The grammar may have moved. The definitive fix is to
+open Trips History in a real database, select one vehicle and a custom range, and
+copy the URL out of the address bar. Whatever that produces is the format to
+generate, and it takes precedence over the documentation.
 
 ## Volume guards
 
