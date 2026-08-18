@@ -143,6 +143,32 @@ Rows with no containing trip (idling with the ignition on between trips) fall
 back to the timestamp plus or minus 15 minutes (`REPLAY_PAD_MS`). Whether the
 page accepts an arbitrary window rather than real trip boundaries is untested.
 
+### The apostrophe bug (v1.1.1)
+
+The actual reason Trips History opened blank in every version up to and including
+v1.1.0 was not the URL grammar. It was `esc()`, which escaped `"` but not `'`,
+while every attribute in `app.js` is written with **single-quoted** delimiters:
+
+```js
+"<a href='" + esc(url) + "' target='_blank' …"
+```
+
+Rison quotes its date values with apostrophes, so the browser closed the `href`
+attribute at the first one and every Replay link was truncated to:
+
+```
+…/#tripsHistory,dateRange:(endDate:
+```
+
+`esc()` now escapes `'` as `&#39;`. It is HTML-only and is not used by the CSV or
+PDF export, so nothing else is affected.
+
+Worth being straight about: since no version ever emitted a complete URL, there is
+no evidence the old `entityType` / `selectedEntities` grammar was broken. The
+v1.1.0 rewrite is still the right call, because it is copied from a URL that
+demonstrably works and it is the only way to open the replay player, but it was
+not the fix.
+
 ### Unverified in this format
 
 - **`expandedCardIds` day number is not zero-padded** (`Aug+8`, not `Aug+08`).
@@ -248,7 +274,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.1.0`. Bump that query
+Cache note: the asset links are versioned with `?v=1.1.1`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 

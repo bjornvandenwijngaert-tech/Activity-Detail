@@ -51,10 +51,16 @@
     });
   }
 
+  // Single quotes MUST be escaped here. Every attribute in this file is written
+  // with single-quoted delimiters, and rison URLs quote their date values with
+  // apostrophes, so leaving ' alone silently truncates every Replay href at the
+  // first date. That was the real cause of the blank Trips History page in
+  // v1.0.0 through v1.1.0, not the URL grammar.
   function esc(str) {
     return String(str == null ? "" : str)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   function fmtDateInput(d) { return d.toISOString().slice(0, 10); }
