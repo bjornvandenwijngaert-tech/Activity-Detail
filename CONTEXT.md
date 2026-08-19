@@ -65,24 +65,30 @@ Per device:
 1. Fetch `LogRecord` for the range. If a `Get` returns 50,000 records (the hard
    cap), the window is halved recursively, up to 6 levels. Logs are de-duplicated
    by id, since split windows overlap on the boundary.
-2. Fetch `StatusData` with `diagnosticSearch: { id: "DiagnosticIgnitionId" }`.
-   The window is extended 24 hours before the from-date, because ignition status
-   is only written on state change, so the state at the start of the range comes
-   from an earlier record.
-3. Collapse the ignition records into on/off transitions and walk the logs in
-   time order:
-   - Crossing an ignition-on transition emits **Ignition on**, positioned on the
-     log being processed (the nearest one in time).
+2. Fetch `StatusData` with `diagnosticSearch: { id: "DiagnosticIgnitionId" }`,
+   over exactly the reporting window. Ignition status is only written on state
+   change, so the state at the start of the range would be unknown, except that
+   MyGeotab returns a boundary record at each end of the window carrying the
+   state at that instant. That record seeds the starting state and is never
+   emitted as a row. See the v1.6.0 section.
+3. Collapse the ignition records into on/off transitions, then merge them with
+   the logs into one time-ordered stream and walk it:
+   - An **Ignition on** / **Ignition off** row keeps the transition's own
+     timestamp and borrows only a position from the nearest log in time.
    - With the ignition on, a log below 1 km/h is idling. The first of a run is
      **Idling start**, the rest are **Idling**, and the log where speed reaches
      1 km/h (or ignition drops) is **Idling end**, carrying
      `Idling time: [3m 08s]`.
    - Any other log with the ignition on is **Moving**.
-   - Crossing an ignition-off transition closes any open idle run, then emits
-     **Ignition off**. Logs recorded while the ignition is off produce no rows.
+   - An ignition-off closes any open idle run first. Logs recorded while the
+     ignition is off produce no rows.
 4. Daily distance is a running cumulative haversine between consecutive logs,
    reset at local midnight. Segments where both endpoints are below 1 km/h are
-   skipped so GPS jitter at a standstill does not inflate the total.
+   skipped so GPS jitter at a standstill does not inflate the total. Boundary
+   records do count here, which is what anchors a day's distance at midnight
+   rather than at the first log after it. The day total is closed on the running
+   figure, not on the last row, because the last row can precede the day's last
+   GPS log.
 5. Speed shows `--` below 1 km/h, matching the reference.
 6. Days are bucketed by calendar day in the **MyGeotab user's** timezone
    (`localDayKey`), not UTC and not the browser's. See the timezone section.
@@ -443,6 +449,124 @@ value is only accepted when it is explicitly `true` or `false`, so an absent
 field cannot silently flip a metric database into miles. The diagnostic strip
 above the results names the active units alongside the timezone and Replay host.
 
+## Boundary records, and why ignition events keep their own time (v1.6.0)
+
+### The bug
+
+A report showed a block of 70 to 105 rows, all alternating Ignition off / on,
+all stamped `00:00:00`, all on identical coordinates, all `0 km`. It looked like
+noise from testbot data. It was not: it reproduced on a real vehicle in ILLE01.
+
+Two causes, both confirmed against raw API pulls rather than by reading code.
+
+### Cause 1: MyGeotab returns synthetic boundary records
+
+A `Get` on `LogRecord` or `StatusData` with a `fromDate`/`toDate` returns a
+manufactured record at **each end** of the window, carrying the state or
+position at that exact instant so a map can draw a continuous line to the edge.
+
+**They have no `id` and no `version`.** Real records have both. That is the only
+reliable way to tell them apart. Do not test the timestamp against the window
+edge: a genuine record can land on midnight.
+
+Measured on ILLE01 device b19:
+
+```
+log status --from 2026-08-18 --to 2026-08-19        (no lookback at all)
+  SYNTHETIC 2026-08-17T23:00:00.000Z data=0     <- exactly local midnight
+  real      2026-08-18T05:46:11.433Z data=1
+  ...
+  SYNTHETIC 2026-08-18T23:00:00.000Z data=0
+
+log record --from 2026-08-18
+  SYNTHETIC 2026-08-17T23:00:00.000Z  54.67593,-5.94538  spd=0
+  bDD99B    2026-08-17T23:22:58.758Z  54.67593,-5.94538  spd=0
+```
+
+Those coordinates are the ones that appeared on every junk row.
+
+The rule the code now follows:
+
+| Use | Boundary record | Why |
+|---|---|---|
+| Seed ignition state at window start | **Yes** | Exactly what it is for |
+| Position / distance baseline | **Yes** | Real position; anchors the day at midnight |
+| Emit a status row | **No** | Nothing happened at that instant |
+| Count as an event | **No** | Inflates the total |
+
+`pts[].boundary` is set from `!l.id`. Boundary points take part in distance
+accumulation and then `continue` before any row is written.
+
+Note that window splitting (`MAX_RECORDS`) creates a boundary record on each
+side of every split point. They share an instant, so the dedupe key
+`"boundary:" + dateTime` collapses them, and they are skipped as rows anyway.
+
+### Consequence: the 24-hour lookback is gone
+
+`fetchIgnition` used to query 24 h before `fromDate` to learn the starting
+ignition state. That was the source of the junk rows, and it was never needed:
+the opening boundary record states the answer at the exact instant, which is
+strictly better than inferring it from the last change some hours earlier.
+
+One less API call per vehicle, and 70 to 105 phantom rows per report that are
+now never fetched rather than fetched and filtered.
+
+### Cause 2: ignition events were pinned to log timestamps
+
+Up to v1.5.0 the engine walked GPS logs and drained any ignition transitions it
+had passed, stamping each with **the log's** timestamp and position. Three
+failures fell out of that:
+
+- Every transition before the first log landed on that one log. With the
+  lookback in place that was a day's worth, all sharing one timestamp.
+- Any transition after the last log of the day was silently dropped. Real case:
+  on 18 Aug the last GPS log is 20:05 and the last ignition off is 21:22, so the
+  day's final Ignition off never appeared.
+- Every ignition row was shown at the wrong time, off by up to the logging
+  interval, which is around 30 minutes on a parked vehicle.
+
+`StatusData` carries its own `dateTime`. It carries no coordinates, which is the
+only reason a log was ever involved.
+
+**Now:** logs and transitions are merged into one time-ordered `stream`, and an
+ignition row keeps its own timestamp while borrowing only a position from the
+nearest log in time (`nearestPt`, binary search). On a tie the ignition change
+sorts first, so an "on" precedes the moving row it enables and an "off"
+suppresses the row at the same instant.
+
+Day totals now close on the running `cumKm` rather than on the last row's
+`distKm`, because the last row of a day can precede the day's last GPS log.
+
+### Verified
+
+`.diag/harness.js` runs the real `buildActivity` against raw ILLE01 pulls
+(the folder is gitignored; re-pull with `cli-mygeotab log record` / `log status`).
+Results for device b19, 18 to 19 Aug 2026:
+
+```
+rows stamped 00:00:00                : 0
+duplicate time+status rows           : 0
+rows at the screenshot's junk coords : 0
+ignition rows sharing one timestamp  : NONE
+rows in time order within each day   : true
+last ignition row                    : 22:22:08 Ignition off   (was dropped)
+```
+
+Distance is identical across all detail levels (532.37 km over 17 to 18 Aug),
+confirming the reduction rules never touched the totals. Against the original
+screenshot's 412.28 km, the engine gives 401.81 km for 18 Aug plus the part of
+19 Aug before the screenshot was taken, so distance was always right; only the
+row count was inflated.
+
+### On ignition bounce
+
+Checked, and deliberately **not** filtered. Across 4 days of b19: 11 ignition-on
+periods under 60 s and 6 off periods under 60 s, out of 280 transitions. Median
+gap 6.8 minutes. Most short cycles are genuine (moving a van a few metres, a
+stall and restart). Only one, a 7 s off inside a 41 s on, looks like real bounce.
+A filter loose enough to catch it would delete genuine short trips. The event
+counts are high because this vehicle really does cycle its ignition a lot.
+
 ## Volume guards
 
 | Guard | Value | Behaviour when hit |
@@ -480,6 +604,12 @@ group-wide run shows output while it is still working.
   mph, that every distance and speed on screen, in the CSV and in the PDF carries
   the same unit, and that the detail notice quotes the imperial thresholds. Then
   switch the profile to metric and confirm it flips on the next run.
+- **No phantom rows (v1.6.0 regression).** On any vehicle and range, confirm no
+  row is stamped at exactly local midnight with `0 km` and a repeated position,
+  and that the ignition rows are all at distinct times. `.diag/harness.js` runs
+  this against raw pulls without needing the add-in installed.
+- **Last event of the day.** Pick a vehicle whose ignition goes off well after
+  its last GPS log and confirm that Ignition off appears, at its own time.
 - **Volume.** Run a group over a week; confirm the notices fire and the progress
   line moves rather than appearing to hang.
 - **Replay.** Click three rows from different days and confirm each lands on the
@@ -503,7 +633,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.5.0`. Bump that query
+Cache note: the asset links are versioned with `?v=1.6.0`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 

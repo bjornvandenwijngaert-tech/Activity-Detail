@@ -433,14 +433,23 @@
     }, function () { cb([]); });
   }
 
-  // Ignition StatusData is written on state change, so the window is extended
-  // back 24 h to pick up the state the vehicle was already in at fromDate.
+  // Ignition StatusData is only written on state change, so the state at the
+  // start of the range comes from before the range. Up to v1.5.0 this was
+  // solved by extending the window back 24 h, which was wrong twice over: it
+  // dragged in a whole day of unrelated events, and it still only inferred the
+  // starting state from the last record before the window.
+  //
+  // No lookback is needed. MyGeotab returns a boundary record at each end of
+  // the search window carrying the state at that exact instant. It has no id
+  // and no version, which is how it is told apart from a real record. Verified
+  // against ILLE01 device b19: a query for 18 Aug alone returns
+  // 2026-08-17T23:00:00Z data=0 with no id, followed by the first real change
+  // at 05:46. See CONTEXT.md.
   function fetchIgnition(deviceId, fromIso, toIso, cb) {
-    var back = new Date(new Date(fromIso).getTime() - 24 * 3600 * 1000).toISOString();
     apiCall("Get", {
       typeName: "StatusData",
       search: {
-        fromDate: back, toDate: toIso,
+        fromDate: fromIso, toDate: toIso,
         deviceSearch: { id: deviceId },
         diagnosticSearch: { id: "DiagnosticIgnitionId" }
       }
@@ -492,7 +501,10 @@
     var pts = [];
     logs.forEach(function (l) {
       if (!l || l.latitude == null || l.longitude == null) return;
-      var k = l.id || (l.dateTime + "");
+      // A boundary record has no id, so fall back to the timestamp. Window
+      // splitting produces one at each side of the split point, and they share
+      // an instant, so this also de-duplicates them.
+      var k = l.id || ("boundary:" + l.dateTime);
       if (seen[k]) return;
       seen[k] = 1;
       pts.push({
@@ -500,32 +512,75 @@
         ms: new Date(l.dateTime).getTime(),
         lat: l.latitude,
         lng: l.longitude,
-        speed: l.speed == null ? 0 : l.speed
+        speed: l.speed == null ? 0 : l.speed,
+        // MyGeotab manufactures a record at each end of the search window so a
+        // map can draw a continuous line to the window edge. The position is
+        // real and worth having, because it anchors the day's distance at
+        // midnight instead of at the first log after it. But nothing happened
+        // at that instant, so it must never become a row.
+        boundary: !l.id
       });
     });
     pts.sort(function (a, b) { return a.ms - b.ms; });
 
-    // Build a collapsed on/off transition list.
+    // Nearest log in time. StatusData carries no coordinates, so an ignition
+    // event borrows a position from the closest log. It borrows the position
+    // only; the timestamp stays its own.
+    function nearestPt(ms) {
+      if (!pts.length) return null;
+      var lo = 0, hi = pts.length - 1;
+      while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+        if (pts[mid].ms < ms) lo = mid + 1; else hi = mid;
+      }
+      var a = pts[lo], b = pts[lo > 0 ? lo - 1 : 0];
+      return Math.abs(a.ms - ms) <= Math.abs(b.ms - ms) ? a : b;
+    }
+
+    // Collapse the ignition records into real state changes. Boundary records
+    // seed the starting state and are never emitted: see fetchIgnition.
     var transitions = [];
+    var seedIgn = null;
     var hasIgnition = ignitionRecs !== null && ignitionRecs.length > 0;
     if (hasIgnition) {
       var sorted = ignitionRecs.slice().sort(function (a, b) {
         return new Date(a.dateTime).getTime() - new Date(b.dateTime).getTime();
       });
-      var last = null;
+      var last = null, sawReal = false;
       sorted.forEach(function (r) {
         var on = Number(r.data) >= 0.5;
-        if (last === null || on !== last) {
-          transitions.push({ ms: new Date(r.dateTime).getTime(), on: on });
-          last = on;
+        var changed = (last === null || on !== last);
+        last = on;
+        if (!r.id) {
+          // Only the opening boundary is a seed. The closing one restates a
+          // state we already know and would otherwise overwrite it.
+          if (!sawReal && seedIgn === null) seedIgn = on;
+          return;
         }
+        sawReal = true;
+        if (changed) transitions.push({ t: r.dateTime, ms: new Date(r.dateTime).getTime(), on: on });
       });
     }
 
-    var ti = 0;
-    // State before the first transition: if the first known transition is an
-    // "off", the vehicle must have been on beforehand; otherwise assume off.
-    var curIgn = hasIgnition ? (transitions.length && !transitions[0].on) : true;
+    // One time-ordered stream of logs and ignition changes. Merging them is
+    // what lets an ignition event keep its own timestamp: up to v1.5.0 events
+    // were drained onto whichever log came next, which stacked several events
+    // on one timestamp and dropped any change after the last log of the day.
+    // On a tie the ignition change goes first, so an "on" precedes the moving
+    // row it enables and an "off" suppresses the row at the same instant.
+    var stream = [], si;
+    for (si = 0; si < pts.length; si++)        stream.push({ ms: pts[si].ms, ign: null, pt: pts[si] });
+    for (si = 0; si < transitions.length; si++) stream.push({ ms: transitions[si].ms, ign: transitions[si], pt: null });
+    stream.sort(function (a, b) {
+      if (a.ms !== b.ms) return a.ms - b.ms;
+      return (a.ign ? 0 : 1) - (b.ign ? 0 : 1);
+    });
+
+    var curIgn;
+    if (!hasIgnition)             curIgn = true;        // no ignition data: show everything
+    else if (seedIgn !== null)    curIgn = seedIgn;     // boundary record knows the answer
+    else if (transitions.length)  curIgn = !transitions[0].on;
+    else                          curIgn = false;
 
     var days = [];
     var day = null;
@@ -536,6 +591,9 @@
     var idleStartMs = 0;
 
     function startDay(key) {
+      // Close the previous day on the running total rather than on its last
+      // row, because the last row of a day can precede its last GPS log.
+      if (day) day.distKm = cumKm;
       day = { dayKey: key, rows: [], distKm: 0, idleMins: 0 };
       days.push(day);
       curDayKey = key;
@@ -544,9 +602,10 @@
       inIdle = false;
     }
 
-    function push(status, cls, pt, durText, showSpeed) {
+    // iso is the event's own time; pt supplies only the position.
+    function pushAt(iso, status, cls, pt, durText, showSpeed) {
       day.rows.push({
-        t: pt.t,
+        t: iso,
         status: status,
         cls: cls,
         duration: durText || "",
@@ -557,61 +616,71 @@
       });
     }
 
-    for (var i = 0; i < pts.length; i++) {
-      var p = pts[i];
-      var key = localDayKey(p.t);
-      if (key !== curDayKey) startDay(key);
+    for (var i = 0; i < stream.length; i++) {
+      var ev = stream[i];
+
+      if (ev.ign) {
+        var tr = ev.ign;
+        if (tr.on === curIgn) continue;
+        var at = nearestPt(tr.ms);
+        if (!at) continue;                       // no position to put it on
+        if (localDayKey(tr.t) !== curDayKey) startDay(localDayKey(tr.t));
+        curIgn = tr.on;
+        if (curIgn) {
+          pushAt(tr.t, "Ignition on", "ignon", at, "", false);
+        } else {
+          if (inIdle) {
+            var im = (tr.ms - idleStartMs) / 60000;
+            day.idleMins += im;
+            inIdle = false;
+            pushAt(tr.t, "Idling end", "idle", at, "Idling time: [" + fmtDurPrecise(im) + "]", false);
+          }
+          pushAt(tr.t, "Ignition off", "ignoff", at, "", false);
+        }
+        continue;
+      }
+
+      var p = ev.pt;
+      if (localDayKey(p.t) !== curDayKey) startDay(localDayKey(p.t));
 
       // Cumulative daily distance. Segments where both ends are stationary are
       // skipped so GPS jitter at a standstill does not inflate the total.
+      // Boundary records take part: that is the point of keeping them.
       if (prevPt && !(prevPt.speed < IDLE_SPEED_KMH && p.speed < IDLE_SPEED_KMH)) {
         cumKm += haversineKm(prevPt, p);
       }
       prevPt = p;
 
-      // Advance the ignition state to this log's timestamp, emitting a row for
-      // each transition we cross, positioned on this log (the nearest one).
-      while (hasIgnition && ti < transitions.length && transitions[ti].ms <= p.ms) {
-        var tr = transitions[ti++];
-        if (tr.on === curIgn) continue;
-        curIgn = tr.on;
-        if (curIgn) {
-          push("Ignition on", "ignon", p, "", false);
-        } else {
-          if (inIdle) {
-            push("Idling end", "idle", p, "Idling time: [" + fmtDurPrecise((tr.ms - idleStartMs) / 60000) + "]", false);
-            day.idleMins += (tr.ms - idleStartMs) / 60000;
-            inIdle = false;
-          }
-          push("Ignition off", "ignoff", p, "", false);
-        }
-      }
-
-      if (!curIgn) continue;  // no rows while the ignition is off
+      if (p.boundary) continue;   // real position, but no event happened here
+      if (!curIgn) continue;      // no rows while the ignition is off
 
       if (p.speed < IDLE_SPEED_KMH) {
         if (!inIdle) {
           inIdle = true;
           idleStartMs = p.ms;
-          push("Idling start", "idle", p, "", false);
+          pushAt(p.t, "Idling start", "idle", p, "", false);
         } else {
-          push("Idling", "idle", p, "", false);
+          pushAt(p.t, "Idling", "idle", p, "", false);
         }
       } else {
         if (inIdle) {
           var mins = (p.ms - idleStartMs) / 60000;
           day.idleMins += mins;
           inIdle = false;
-          push("Idling end", "idle", p, "Idling time: [" + fmtDurPrecise(mins) + "]", true);
+          pushAt(p.t, "Idling end", "idle", p, "Idling time: [" + fmtDurPrecise(mins) + "]", true);
         } else {
-          push("Moving", "moving", p, "", true);
+          pushAt(p.t, "Moving", "moving", p, "", true);
         }
       }
     }
 
-    // Close an idle run still open at the end of the window.
-    if (inIdle && day && pts.length) {
-      var lastPt = pts[pts.length - 1];
+    if (day) day.distKm = cumKm;
+
+    // Close an idle run still open at the end of the window, on the last real
+    // log rather than on a boundary record.
+    var realPts = pts.filter(function (q) { return !q.boundary; });
+    if (inIdle && day && realPts.length) {
+      var lastPt = realPts[realPts.length - 1];
       var openMins = (lastPt.ms - idleStartMs) / 60000;
       if (openMins > 0) {
         day.idleMins += openMins;
@@ -625,7 +694,6 @@
 
     // A day where the ignition never came on produces no rows — drop it.
     days = days.filter(function (d) { return d.rows.length > 0; });
-    days.forEach(function (d) { d.distKm = d.rows[d.rows.length - 1].distKm; });
 
     // Reduce AFTER the engine has run and AFTER the day total is taken, so the
     // rules only affect which rows are shown. Distance still accumulates over
