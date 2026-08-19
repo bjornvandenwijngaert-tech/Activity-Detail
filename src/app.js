@@ -29,6 +29,34 @@
   var COORD_DP        = 4;      // ~11 m dedupe grid for geocoding
   var GEOTAB_NAVY     = [39, 50, 93];
 
+  // Row emission rules. A row is written when something actually changed, not
+  // on a timer, which is what the customer's reference report appears to do:
+  // its rows sit 1 to 3 minutes apart but the distance between them is close to
+  // constant, which is a distance trigger, not a clock.
+  //
+  //   distKm      cumulative distance since the last row
+  //   speedKmh    absolute change in spot speed since the last row. Absolute,
+  //               not a percentage: 20% of 2 km/h is 0.4 km/h, which is inside
+  //               GPS noise, so a relative threshold fires nonstop at low speed
+  //               and never fires on a motorway.
+  //   headingDeg  change in direction of travel, computed from consecutive
+  //               coordinates. This is the cheap stand-in for "we are on a
+  //               different street". Street name itself would mean reverse
+  //               geocoding every single log before deciding what to keep,
+  //               roughly 3x the GetAddresses volume, and the name flips
+  //               between parallel roads at junctions.
+  //   maxGapMs    ceiling: emit anyway after this long with nothing changing,
+  //               so a steady motorway run still shows signs of life.
+  //   minGapMs    floor: never two rows closer than this, so a roundabout does
+  //               not produce six rows in ten seconds. Status changes ignore
+  //               the floor.
+  var DETAIL_LEVELS = {
+    key:      { distKm: 5,   speedKmh: 30, headingDeg: 90, maxGapMs: 900000, minGapMs: 60000 },
+    balanced: { distKm: 1.5, speedKmh: 20, headingDeg: 45, maxGapMs: 300000, minGapMs: 30000 },
+    detailed: { distKm: 0.5, speedKmh: 10, headingDeg: 30, maxGapMs: 120000, minGapMs: 15000 },
+    all:      null
+  };
+
   // ─── State ───────────────────────────────────────────────────────────────
   var S = {
     api:        null,
@@ -40,7 +68,7 @@
     devices:    [],     // [{ id, name, days: [{ dayKey, rows, distKm, idleMins }] }]
     warnings:   [],
     running:    false,
-    minGapMs:   0       // row sampling floor in ms; 0 shows every GPS log
+    rules:      null    // active DETAIL_LEVELS entry; null shows every GPS log
   };
 
   // ─── Generic helpers ─────────────────────────────────────────────────────
@@ -132,6 +160,21 @@
     var h = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
             Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
     return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+
+  // Direction of travel from a to b, 0-360 degrees clockwise from north.
+  function bearingDeg(a, b) {
+    var la1 = a.lat * Math.PI / 180, la2 = b.lat * Math.PI / 180;
+    var dLon = (b.lng - a.lng) * Math.PI / 180;
+    var y = Math.sin(dLon) * Math.cos(la2);
+    var x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dLon);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+
+  // Shortest angle between two bearings, so 350 and 10 are 20 degrees apart.
+  function angleDelta(a, b) {
+    var d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
   }
 
   function downloadCsvBlob(rows, filename) {
@@ -412,35 +455,88 @@
     days = days.filter(function (d) { return d.rows.length > 0; });
     days.forEach(function (d) { d.distKm = d.rows[d.rows.length - 1].distKm; });
 
-    // Thin AFTER the engine has run and AFTER the day total is taken, so
-    // sampling only affects which rows are shown. Distance still accumulates
-    // over every GPS log and idling is still measured start to end.
-    thinRows(days, S.minGapMs);
+    // Reduce AFTER the engine has run and AFTER the day total is taken, so the
+    // rules only affect which rows are shown. Distance still accumulates over
+    // every GPS log and idling is still measured start to end.
+    reduceRows(days, S.rules);
 
     return { days: days, hasIgnition: hasIgnition };
   }
 
   // A device reporting every 10 to 60 seconds produces far more rows than the
-  // customer's reference report, which sits around 1 to 3 minutes apart. Drop
-  // the repetitive continuation rows and keep everything that carries meaning:
-  // every status change, and the last row of the day so the running distance
-  // still ends on the day total.
-  function thinRows(days, minGapMs) {
-    if (!minGapMs) return;
+  // customer's reference report. Rather than a fixed interval, keep a row only
+  // when it says something the previous kept row did not: see DETAIL_LEVELS.
+  //
+  // Every status change survives regardless, as does the first and last row of
+  // the day, so the running distance still ends on the day total.
+  function reduceRows(days, rules) {
+    if (!rules) return;
+
     days.forEach(function (d) {
-      var kept = [], lastMs = -Infinity;
-      for (var i = 0; i < d.rows.length; i++) {
-        var r = d.rows[i];
-        var ms = new Date(r.t).getTime();
-        var isChange = (r.status !== "Moving" && r.status !== "Idling");
-        if (isChange || i === d.rows.length - 1 || ms - lastMs >= minGapMs) {
-          kept.push(r);
-          lastMs = ms;
-        }
+      var rows = d.rows, i, r;
+      if (rows.length < 3) return;
+
+      // Heading at each row, taken from the previous row's position. Null when
+      // the vehicle moved less than 20 m, because a bearing over a few metres
+      // is GPS noise rather than a turn.
+      var prev = null;
+      for (i = 0; i < rows.length; i++) {
+        r = rows[i];
+        r.ms  = new Date(r.t).getTime();
+        r.hdg = (prev && haversineKm(prev, r) >= 0.02) ? bearingDeg(prev, r) : null;
+        prev = r;
       }
-      if (kept.length < d.rows.length) d.logCount = d.rows.length;
+
+      var kept = [], lastKept = null;
+      for (i = 0; i < rows.length; i++) {
+        r = rows[i];
+        var isChange = (r.status !== "Moving" && r.status !== "Idling");
+        var why = "";
+
+        if (isChange)                  why = "status change";
+        else if (!lastKept)            why = "first row of the day";
+        else if (i === rows.length - 1) why = "last row of the day";
+        else {
+          var gap = r.ms - lastKept.ms;
+          // Below the floor nothing qualifies, so a burst of triggers at a
+          // junction collapses into one row.
+          if (gap >= rules.minGapMs) {
+            var spd     = r.speed == null ? 0 : r.speed;
+            var lastSpd = lastKept.speed == null ? 0 : lastKept.speed;
+
+            if (r.distKm - lastKept.distKm >= rules.distKm) {
+              why = "travelled " + rules.distKm + " km";
+            } else if (Math.abs(spd - lastSpd) >= rules.speedKmh) {
+              why = "speed changed by " + rules.speedKmh + " km/h or more";
+            } else if (r.hdg != null && lastKept.hdg != null && spd >= IDLE_SPEED_KMH &&
+                       angleDelta(r.hdg, lastKept.hdg) >= rules.headingDeg) {
+              why = "changed direction by " + rules.headingDeg + " degrees or more";
+            } else if (gap >= rules.maxGapMs) {
+              why = "nothing changed for " + Math.round(rules.maxGapMs / 60000) + " minutes";
+            }
+          }
+        }
+
+        if (!why) continue;
+        r.why = why;
+        kept.push(r);
+        lastKept = r;
+      }
+
+      if (kept.length < rows.length) d.logCount = rows.length;
       d.rows = kept;
     });
+  }
+
+  // Plain-language version of the active rules, for the notice above the table.
+  function describeRules(r) {
+    return "A row is written whenever something changes: any status change, " +
+      r.distKm + " km travelled, a speed change of " + r.speedKmh + " km/h, a turn of " +
+      r.headingDeg + " degrees, or " + Math.round(r.maxGapMs / 60000) +
+      " minutes with none of those. Rows are never closer together than " +
+      Math.round(r.minGapMs / 1000) + " seconds, except for status changes. " +
+      "Daily distance and idling times are still calculated from every GPS log. " +
+      "Hover over a time to see why that row is there, or pick 'Every GPS log' to see them all.";
   }
 
   // ─── Reverse geocoding ───────────────────────────────────────────────────
@@ -662,7 +758,9 @@
           : Math.round(r.speed) + " km/h";
         var url = replayUrl(dev.id, r.t, r.trip);
         body += "<tr>"
-          + "<td class='val-num'>" + dateCell + "</td>"
+          // The "why" tooltip is what makes an uneven row count explainable:
+          // hovering a time says which rule put that row on the page.
+          + "<td class='val-num'" + (r.why ? " title='Shown because: " + esc(r.why) + "'" : "") + ">" + dateCell + "</td>"
           + "<td><span class='val-status'><span class='val-dot val-dot-" + r.cls + "'></span>" + esc(r.status) + "</span></td>"
           + "<td class='val-dur'>" + esc(r.duration) + "</td>"
           + "<td class='val-num'>" + esc(fmtKm(r.distKm)) + "</td>"
@@ -886,13 +984,8 @@
     S.devices = [];
     S.warnings = [];
     S.addrMap = {};
-    S.minGapMs = parseInt($("val-interval").value, 10) || 0;
-    if (S.minGapMs) {
-      addWarning("Rows are sampled to roughly one every " + (S.minGapMs / 60000) +
-        " minute" + (S.minGapMs === 60000 ? "" : "s") +
-        ". Every status change is still shown, and daily distance and idling times are still" +
-        " calculated from every GPS log. Pick 'Every GPS log' to see them all.");
-    }
+    S.rules = DETAIL_LEVELS[$("val-detail").value] || null;
+    if (S.rules) addWarning(describeRules(S.rules));
     if (!resolveHost()) {
       addWarning("The MyGeotab server or database name could not be worked out for this page, so the Replay links will not work. Everything else in the report is unaffected.");
     }

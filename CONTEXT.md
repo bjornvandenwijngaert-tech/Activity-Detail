@@ -89,14 +89,75 @@ Per device:
 `IDLE_SPEED_KMH = 1` matches Geotab's own definition of idling: speed below
 1 km/h with the ignition on.
 
-## Row sampling (v1.2.0)
+## Which rows get written (v1.3.0)
 
 Geotab devices log every 10 to 60 seconds. The customer's reference report sits
 around 1 to 3 minutes apart, so one row per GPS log is denser than the thing being
-replicated. The toolbar has a spacing picker: every GPS log, or a row roughly
-every 1, 2, 3 or 5 minutes. **Default is 1 minute.**
+replicated.
 
-`thinRows()` runs at the end of `buildActivity`, after the status engine and after
+v1.2.0 solved that with a fixed interval picker. **v1.3.0 replaced it**, because a
+fixed interval makes the user tune a number they have no basis for choosing and
+produces rows that carry no information: three identical `Moving` rows on a
+motorway, one row for a slow crawl through a town.
+
+Rows are now written **when something changes**. `reduceRows()` walks the day and
+keeps a row only when it says something the previous kept row did not.
+
+| Trigger | Balanced default | Cost |
+|---|---|---|
+| Any status change | always, ignores the floor | free |
+| Distance travelled since the last row | 1.5 km | free, already computed |
+| Absolute change in spot speed | 20 km/h | free |
+| Change in direction of travel | 45 degrees | free, bearing from consecutive coordinates |
+| Ceiling: nothing changed for | 5 minutes | free |
+| Floor: never two rows closer than | 30 seconds | free |
+
+Presets in the toolbar: **Key changes only** (5 km / 30 km/h / 90 deg / 15 min /
+60 s), **Balanced detail** (the default, above), **High detail** (0.5 km / 10 km/h
+/ 30 deg / 2 min / 15 s), and **Every GPS log**, which skips the reduction.
+
+### Why these triggers and not the obvious ones
+
+**Distance, not time.** In the customer's reference screenshot the daily distance
+runs 0, 0.95, 2.49, 4.02: deltas of roughly 0.95, 1.54, 1.53 km while the time gaps
+vary from 1 to 3 minutes. Near-constant distance with varying time is a distance
+trigger. A clock would give the opposite. Small sample, but it is the only evidence
+available until the customer's full export arrives, and that is the single check
+worth running on it: are the distance deltas near-constant, or the time deltas?
+
+**Absolute speed change, not a percentage.** 20% of 2 km/h is 0.4 km/h, which is
+inside GPS speed noise, so a relative threshold fires nonstop at low speed. At the
+other end, 90 to 108 km/h is 20% and means nothing. An absolute km/h delta behaves
+the same at both ends.
+
+**Heading change instead of street name.** A street-name trigger sounds right and is
+the one genuinely expensive idea here, for three reasons:
+
+- It inverts the pipeline. You cannot know the street changed without reverse
+  geocoding **every** log before deciding what to keep. A vehicle logging every
+  20 seconds over an 8-hour shift is about 1,500 points; at the old 1-minute
+  sampling roughly 480 were geocoded. That is around 3x the `GetAddresses` volume,
+  and `GEOCODE_MAX_PTS` would be reached after 4 to 8 vehicle-days instead of 25.
+- The signal is noisy. `GetAddresses` snaps a coordinate to a nearby segment, and
+  near junctions or parallel service roads that snap flips between two names for a
+  stationary vehicle, producing phantom rows.
+- It is wrong in both directions at once. An hour on a motorway is one street name,
+  so one row for an hour. A town centre gives a new street every 15 seconds, denser
+  than logging every fix.
+
+There is also direct evidence against it: the reference report repeats the same
+location across consecutive rows, which it could not do if street change were a
+trigger.
+
+Heading change is the cheap, deterministic stand-in. It is computed from consecutive
+coordinates, so it costs nothing, and a 45-degree turn is what "we are on a
+different street" actually looks like in the data. Bearings are only computed when
+the vehicle moved at least 20 m between logs, since a bearing over a few metres is
+noise, and the trigger is ignored below 1 km/h.
+
+### What is preserved
+
+`reduceRows()` runs at the end of `buildActivity`, after the status engine and after
 the day total is taken. What that ordering buys:
 
 - **Distance still accumulates over every log.** The Daily distance column is the
@@ -105,14 +166,19 @@ the day total is taken. What that ordering buys:
 - **Idling is still measured start to end**, not between surviving rows.
 - **Every status change survives.** Only `Moving` and `Idling` continuation rows
   are candidates for dropping. Ignition on, Ignition off, Idling start and Idling
-  end are always kept, as is the last row of the day.
+  end are always kept, as are the first and last rows of the day.
 
-Sampling also happens **before** geocoding, so a 1-minute floor cuts `GetAddresses`
-volume by roughly the same factor it cuts rows.
+Reduction also happens **before** geocoding, so it cuts `GetAddresses` volume by
+roughly the same factor it cuts rows. This is exactly the ordering a street-name
+trigger would destroy.
 
-Nothing is hidden silently: a notice states the spacing and what it does not
-affect, and a sampled day's total line reads `42 of 310 logs` rather than
-`42 events`.
+Nothing is hidden silently. Three things say so on screen:
+
+- a notice above the table spells out the active thresholds in plain words
+- a reduced day's total line reads `42 of 310 logs` rather than `42 events`
+- **every row carries a `why`**, shown as a tooltip on its time cell: "Shown
+  because: travelled 1.5 km". That is what makes an uneven row count explainable,
+  which is the one real cost of event-driven emission over a fixed interval.
 
 ## Known limits and things to verify
 
@@ -316,8 +382,14 @@ group-wide run shows output while it is still working.
   line moves rather than appearing to hang.
 - **Replay.** Click three rows from different days and confirm each lands on the
   right vehicle in the right window.
+- **Row triggers.** On Balanced, confirm the rows land roughly 1 to 3 minutes apart
+  at road speed, and hover a few times to check the stated reason matches what the
+  vehicle was doing. Untested against live data as of v1.3.0; the thresholds are
+  reasoned from twelve rows of the customer's screenshot, not measured.
 - **Side by side.** Put the output next to the customer's reference export and
-  check column for column.
+  check column for column. While it is open, measure whether the distance deltas
+  between their rows are near-constant or the time deltas are. That settles their
+  actual rule and lets the defaults be set from data instead of inference.
 
 ## Hosting
 
@@ -329,7 +401,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.2.0`. Bump that query
+Cache note: the asset links are versioned with `?v=1.3.0`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 
