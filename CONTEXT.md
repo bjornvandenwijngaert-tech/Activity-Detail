@@ -97,8 +97,8 @@ Per device:
 - **Distance is GPS-derived**, so a day total can drift slightly from Geotab's
   odometer-based `Trip.Distance`. If the customer needs the two to agree, scale
   the day's haversine total to the summed `Trip.Distance` for that day.
-- **Replay links** were rewritten in v1.1.0 against a real URL rather than the
-  documentation, and have not been clicked in a live database since. See below.
+- **Replay links** use the `devices` grammar confirmed from a hand-made URL in
+  v1.1.3. See below for the format and how four earlier versions got it wrong.
 - **Fallback when there is no ignition data.** If a vehicle returns no ignition
   records, the engine treats the ignition as on for the whole range and derives
   idling from GPS speed alone. A visible warning says so, because those totals
@@ -106,48 +106,65 @@ Per device:
 
 ## Replay link
 
-**The SDK documentation for this is wrong.** The examples in
+**Do not use the SDK guide for this.** The examples in
 [Using MyGeotab URLs](https://developers.geotab.com/myGeotab/guides/myGeotabUrls/)
-date from 2015, and Geotab simplified MyGeotab URLs in 2022. `entityType` and
-`selectedEntities` are no longer read by the Trips History page. Every version
-from v1.0.0 to v1.0.2 sent them and opened a blank page.
+date from 2015, Geotab simplified MyGeotab URLs in 2022, and the guide was never
+updated. `entityType` and `selectedEntities` are dead names. Building from the
+documentation cost four broken versions.
 
-v1.1.0 uses the real grammar, taken from a URL copied out of the address bar of a
-live database:
+The grammar below is ground truth: a URL copied out of the address bar after
+selecting one vehicle and a custom date range by hand in `demo_smb_onboarding_uk`.
 
 ```
 #tripsHistory,
-dateRange:(endDate:'2026-08-19T22:59:59.000Z',label:Today,startDate:'2026-08-18T23:00:00.000Z'),
-expandedCardIds:!('b11_UnknownDriverId_Tue+Aug+18'),
+dateRange:(endDate:'2026-08-18T22:59:59.000Z',label:Custom,startDate:'2026-08-17T23:00:00.000Z'),
+devices:!(bC),
+expandedCardIds:!('bC_UnknownDriverId_Tue+Aug+18'),
 isReplayPlayerHidden:!f,
-mapBounds:!(42.62073,2.82396,37.62609,-4.1194),
-routes:(b11:!((start:'2026-08-18T21:14:40.557Z',stop:'2026-08-18T23:38:26.557Z')))
+mapBounds:!(42.36028,-8.31496,41.7536,-9.18288),
+routes:(bC:!((start:'2026-08-18T02:46:00.700Z',stop:'2026-08-18T02:51:47.700Z'),…))
 ```
 
 | Parameter | What it does | Generated? |
 |---|---|---|
-| `routes` | Map of device id to trip segments. Picks the vehicle **and** draws the segment. Replaces `entityType` + `selectedEntities` entirely. | Yes |
+| `devices` | **The vehicle filter.** A rison list of bare device ids. | Yes |
+| `routes` | Map of device id to segments to draw. Does **not** select the vehicle. MyGeotab fills it with every trip in the range; the add-in sends exactly one, since the point is the moment in the row. | Yes, one segment |
 | `isReplayPlayerHidden:!f` | Rison `!f` is false, so the replay player opens. Without it the page draws a static route. | Yes |
-| `dateRange` | Scopes the trip list. `label` is a UI convenience, omitted since explicit dates are supplied. | Yes, row's local day |
+| `dateRange` | Scopes the trip list. `label:Custom` goes with an explicit start and end. | Yes, row's local day |
 | `expandedCardIds` | Opens the matching trip card in the side list. `<deviceId>_<driverId>_<Ddd+Mmm+D>`, spaces as `+`. | Yes, when a trip matched |
 | `mapBounds` | Viewport only. | No, so the map fits the route |
-| `entityType` + `selectedEntities` | The vehicle filter. **Absent from the sample URL**, because that page already had the vehicle picked in the UI. | Yes, restored in v1.1.2 |
 
-v1.1.0 dropped `entityType` / `selectedEntities` on the theory that `routes`
-replaced them. Testing v1.1.1 disproved that: the date filtered, the vehicle did
-not. They do different jobs, so v1.1.2 sends both. Keys are emitted
-alphabetically, matching MyGeotab's own serialisation order.
+Keys are emitted alphabetically, matching MyGeotab's own serialisation order.
 
-### Why Trip is now fetched
+### Why Trip is fetched
 
 `routes` needs a segment's exact start and stop. A row carries a single
-timestamp, so v1.1.0 adds one `Get` on `Trip` per vehicle and binary-searches for
-the trip containing each row's timestamp. That data is used **only** for the
-Replay link; nothing in the report body depends on it.
+timestamp, so v1.1.0 added one `Get` on `Trip` per vehicle and binary-searches for
+the trip containing each row's timestamp. Used **only** for the Replay link;
+nothing in the report body depends on it.
+
+Verified against the ground-truth URL: for device `bC` on 18 Aug the add-in
+selected `02:46:00.700Z` to `02:51:47.700Z`, identical to MyGeotab's own first
+segment. The trip matching is correct.
 
 Rows with no containing trip (idling with the ignition on between trips) fall
 back to the timestamp plus or minus 15 minutes (`REPLAY_PAD_MS`). Whether the
 page accepts an arbitrary window rather than real trip boundaries is untested.
+
+### How this went wrong, so it does not repeat
+
+Four versions failed before one capture from the address bar settled it:
+
+| Version | Theory | Reality |
+|---|---|---|
+| v1.0.0–v1.0.2 | Documented `selectedEntities` grammar, wrong quoting, then host resolution | Never emitted a complete URL; nothing was actually under test |
+| v1.1.0 | Docs are stale, `routes` replaces the vehicle filter | `routes` does not select the vehicle |
+| v1.1.1 | `esc()` truncated every href at the first apostrophe | Correct, and the real defect all along |
+| v1.1.2 | Restore `entityType` / `selectedEntities` alongside `routes` | Both names are dead |
+| v1.1.3 | `devices:!(id)`, from a hand-made URL | Ground truth |
+
+The lesson is cheap to state: for MyGeotab URL grammar, one address-bar capture
+beats any amount of documentation and reasoning. Ask for it first.
 
 ### The apostrophe bug (v1.1.1)
 
@@ -169,19 +186,14 @@ attribute at the first one and every Replay link was truncated to:
 `esc()` now escapes `'` as `&#39;`. It is HTML-only and is not used by the CSV or
 PDF export, so nothing else is affected.
 
-Worth being straight about: since no version ever emitted a complete URL, there is
-no evidence the old `entityType` / `selectedEntities` grammar was broken. The
-v1.1.0 rewrite is still the right call, because it is copied from a URL that
-demonstrably works and it is the only way to open the replay player, but it was
-not the fix.
+This bug also masked the grammar problem: no version before v1.1.1 ever emitted a
+complete URL, so nothing about the parameters was ever really under test.
 
 ### Unverified in this format
 
 - **`expandedCardIds` day number is not zero-padded** (`Aug+8`, not `Aug+08`).
   The one real sample has a two-digit day so it does not settle the question. If
   it is wrong the card just does not expand; the route and replay still work.
-- **`label` is omitted.** The real sample always carries one (`label:Today`). If
-  the date range misbehaves, try `label:Custom`.
 - **The card date uses browser local time**, so it inherits the timezone bug
   below. Same low blast radius: a wrong card id means an unexpanded card.
 
@@ -280,7 +292,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.1.2`. Bump that query
+Cache note: the asset links are versioned with `?v=1.1.3`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 

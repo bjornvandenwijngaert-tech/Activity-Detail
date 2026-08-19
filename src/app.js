@@ -477,27 +477,29 @@
   // selectedEntities are no longer read by the Trips History page, which is why
   // v1.0.0 to v1.0.2 all opened a blank page.
   //
-  // This is a real URL copied out of the address bar of a live database:
+  // This is a real URL, copied out of the address bar after selecting one
+  // vehicle and a custom date range by hand in a live database:
   //
   //   #tripsHistory,
-  //   dateRange:(endDate:'2026-08-19T22:59:59.000Z',label:Today,startDate:'2026-08-18T23:00:00.000Z'),
-  //   expandedCardIds:!('b11_UnknownDriverId_Tue+Aug+18'),
+  //   dateRange:(endDate:'2026-08-18T22:59:59.000Z',label:Custom,startDate:'2026-08-17T23:00:00.000Z'),
+  //   devices:!(bC),
+  //   expandedCardIds:!('bC_UnknownDriverId_Tue+Aug+18'),
   //   isReplayPlayerHidden:!f,
-  //   mapBounds:!(42.62073,2.82396,37.62609,-4.1194),
-  //   routes:(b11:!((start:'2026-08-18T21:14:40.557Z',stop:'2026-08-18T23:38:26.557Z')))
+  //   mapBounds:!(42.36028,-8.31496,41.7536,-9.18288),
+  //   routes:(bC:!((start:'2026-08-18T02:46:00.700Z',stop:'2026-08-18T02:51:47.700Z'),…))
   //
   // What each part does:
-  //   routes                a map of device id to trip segments. Draws the
-  //                         segment. Confirmed by testing that this does NOT on
-  //                         its own put the vehicle in the page's filter.
-  //   entityType /          the vehicle filter. Absent from the sample URL above,
-  //   selectedEntities      because that page already had the vehicle selected in
-  //                         the UI. Sent alongside routes rather than instead of
-  //                         it: they do different jobs.
+  //   devices               THE vehicle filter. Not entityType/selectedEntities,
+  //                         which are stale documentation names and do nothing.
+  //   routes                a map of device id to trip segments to draw. Does not
+  //                         select the vehicle on its own; devices does that.
+  //                         MyGeotab populates every trip in the range here. One
+  //                         segment is deliberate: the point is to land on the
+  //                         moment in the row, not redraw the whole day.
   //   isReplayPlayerHidden  rison !f is false, so the replay player opens.
   //                         Without it the page shows a static route.
-  //   dateRange             scopes the trip list. label is a UI convenience and
-  //                         is omitted here, since explicit dates are given.
+  //   dateRange             scopes the trip list. label:Custom accompanies an
+  //                         explicit start and end.
   //   expandedCardIds       opens the matching trip card in the side list.
   //                         "<deviceId>_<driverId>_<Ddd+Mmm+D>", spaces as "+".
   //   mapBounds             viewport only; omitted so the map fits the route.
@@ -536,13 +538,12 @@
     // serialises them in. Order should not matter to a rison parser, but
     // matching the app removes one variable while this is still being proven.
     var parts = [
-      "dateRange:(endDate:'" + dayEnd.toISOString() + "',startDate:'" + dayStart.toISOString() + "')",
-      "entityType:Device"
+      "dateRange:(endDate:'" + dayEnd.toISOString() + "',label:Custom,startDate:'" + dayStart.toISOString() + "')",
+      "devices:!(" + deviceId + ")"
     ];
     if (cardId) parts.push("expandedCardIds:!('" + cardId + "')");
     parts.push("isReplayPlayerHidden:!f");
     parts.push("routes:(" + deviceId + ":!((start:'" + segStart + "',stop:'" + segStop + "')))");
-    parts.push("selectedEntities:!(" + deviceId + ")");
 
     return "https://" + S.server + "/" + S.dbName + "/#tripsHistory," + parts.join(",");
   }
