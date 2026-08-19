@@ -39,7 +39,8 @@
     addrMap:    {},     // "lat,lng" -> resolved address
     devices:    [],     // [{ id, name, days: [{ dayKey, rows, distKm, idleMins }] }]
     warnings:   [],
-    running:    false
+    running:    false,
+    minGapMs:   0       // row sampling floor in ms; 0 shows every GPS log
   };
 
   // ─── Generic helpers ─────────────────────────────────────────────────────
@@ -411,7 +412,35 @@
     days = days.filter(function (d) { return d.rows.length > 0; });
     days.forEach(function (d) { d.distKm = d.rows[d.rows.length - 1].distKm; });
 
+    // Thin AFTER the engine has run and AFTER the day total is taken, so
+    // sampling only affects which rows are shown. Distance still accumulates
+    // over every GPS log and idling is still measured start to end.
+    thinRows(days, S.minGapMs);
+
     return { days: days, hasIgnition: hasIgnition };
+  }
+
+  // A device reporting every 10 to 60 seconds produces far more rows than the
+  // customer's reference report, which sits around 1 to 3 minutes apart. Drop
+  // the repetitive continuation rows and keep everything that carries meaning:
+  // every status change, and the last row of the day so the running distance
+  // still ends on the day total.
+  function thinRows(days, minGapMs) {
+    if (!minGapMs) return;
+    days.forEach(function (d) {
+      var kept = [], lastMs = -Infinity;
+      for (var i = 0; i < d.rows.length; i++) {
+        var r = d.rows[i];
+        var ms = new Date(r.t).getTime();
+        var isChange = (r.status !== "Moving" && r.status !== "Idling");
+        if (isChange || i === d.rows.length - 1 || ms - lastMs >= minGapMs) {
+          kept.push(r);
+          lastMs = ms;
+        }
+      }
+      if (kept.length < d.rows.length) d.logCount = d.rows.length;
+      d.rows = kept;
+    });
   }
 
   // ─── Reverse geocoding ───────────────────────────────────────────────────
@@ -598,6 +627,14 @@
     alert("Could not work out the MyGeotab address for this database, so the Replay link cannot be built.");
   }
 
+  // Says how many rows are shown, and how many logs are behind them when the
+  // day has been sampled, so a thinned day never reads as a complete one.
+  function eventCount(d) {
+    return d.logCount
+      ? d.rows.length + " of " + d.logCount + " logs"
+      : d.rows.length + " events";
+  }
+
   // ─── Rendering ───────────────────────────────────────────────────────────
   var COLS = ["Date", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Replay"];
 
@@ -644,7 +681,7 @@
       body += "<tr class='val-day-total'>"
         + "<td colspan='3'>" + esc(fmtDayReadable(d.dayKey)) + " total</td>"
         + "<td class='val-num'>" + esc(fmtKm(d.distKm)) + "</td>"
-        + "<td colspan='4'>" + esc(fmtDurWhole(d.idleMins)) + " idling &middot; " + d.rows.length + " events</td>"
+        + "<td colspan='4'>" + esc(fmtDurWhole(d.idleMins)) + " idling &middot; " + esc(eventCount(d)) + "</td>"
         + "</tr>";
 
       html += "<div class='val-table-wrap'><table class='dd-table'><thead><tr>"
@@ -706,7 +743,8 @@
             fmtKm(r.distKm),
             (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : Math.round(r.speed) + " km/h",
             addressFor(r),
-            r.lat.toFixed(5) + ", " + r.lng.toFixed(5)
+            r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
+            replayUrl(dev.id, r.t, r.trip)
           ]);
         });
       });
@@ -714,7 +752,7 @@
     return out;
   }
 
-  var CSV_HEAD = ["Vehicle", "Date", "Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates"];
+  var CSV_HEAD = ["Vehicle", "Date", "Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Replay"];
 
   function exportCsv() {
     if (!S.devices.length) { alert("Run the report first."); return; }
@@ -759,15 +797,22 @@
         doc.text(dev.name + "  |  " + fmtDayReadable(d.dayKey), margin, yPos);
         yPos += 4;
 
+        // Row index in this table -> Replay URL, for the link annotations below.
+        // Rebuilt per table, because autoTable's row.index is table-relative.
+        var pdfUrls = [];
+
         var body = [];
         for (var ri = 0; ri < d.rows.length; ri++) {
           if (emitted >= PDF_MAX_ROWS) { truncated = true; break; }
           var r = d.rows[ri];
+          var rUrl = replayUrl(dev.id, r.t, r.trip);
           body.push([
             fmtTime(r.t), r.status, r.duration, fmtKm(r.distKm),
             (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : Math.round(r.speed) + " km/h",
-            addressFor(r), r.lat.toFixed(5) + ", " + r.lng.toFixed(5)
+            addressFor(r), r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
+            rUrl ? "REPLAY" : ""
           ]);
+          pdfUrls.push(rUrl);
           emitted++;
         }
         body.push([
@@ -776,18 +821,33 @@
           { content: fmtDurWhole(d.idleMins) + " idling", styles: { fontStyle: "bold", fillColor: [245, 245, 245] } },
           { content: fmtKm(d.distKm), styles: { fontStyle: "bold", fillColor: [245, 245, 245] } },
           { content: "", styles: { fillColor: [245, 245, 245] } },
-          { content: d.rows.length + " events", styles: { fillColor: [245, 245, 245] } },
+          { content: eventCount(d), styles: { fillColor: [245, 245, 245] } },
+          { content: "", styles: { fillColor: [245, 245, 245] } },
           { content: "", styles: { fillColor: [245, 245, 245] } }
         ]);
 
         doc.autoTable({
           startY: yPos,
-          head: [["Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates"]],
+          head: [["Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Replay"]],
           body: body,
           margin: { left: margin, right: margin },
           styles: { fontSize: 7.5, cellPadding: 1.6, textColor: [45, 55, 72], overflow: "linebreak" },
           headStyles: { fillColor: [0, 120, 212], textColor: 255, fontStyle: "bold", fontSize: 7.5 },
-          columnStyles: { 0: { cellWidth: 20 }, 1: { cellWidth: 22 }, 2: { cellWidth: 38 }, 3: { cellWidth: 24 }, 4: { cellWidth: 18 }, 6: { cellWidth: 34 } }
+          columnStyles: {
+            0: { cellWidth: 20 }, 1: { cellWidth: 22 }, 2: { cellWidth: 38 }, 3: { cellWidth: 24 },
+            4: { cellWidth: 18 }, 6: { cellWidth: 34 },
+            7: { cellWidth: 16, textColor: [0, 120, 212], fontStyle: "bold" }
+          },
+          // A PDF link is an annotation over a rectangle, not styled text, so it
+          // has to be drawn once the cell's final position on the page is known.
+          didDrawCell: (function (urls) {
+            return function (data) {
+              if (data.section !== "body" || data.column.index !== 7) return;
+              var u = urls[data.row.index];
+              if (!u) return;
+              doc.link(data.cell.x, data.cell.y, data.cell.width, data.cell.height, { url: u });
+            };
+          })(pdfUrls)
         });
         yPos = doc.lastAutoTable.finalY + 6;
       }
@@ -826,6 +886,13 @@
     S.devices = [];
     S.warnings = [];
     S.addrMap = {};
+    S.minGapMs = parseInt($("val-interval").value, 10) || 0;
+    if (S.minGapMs) {
+      addWarning("Rows are sampled to roughly one every " + (S.minGapMs / 60000) +
+        " minute" + (S.minGapMs === 60000 ? "" : "s") +
+        ". Every status change is still shown, and daily distance and idling times are still" +
+        " calculated from every GPS log. Pick 'Every GPS log' to see them all.");
+    }
     if (!resolveHost()) {
       addWarning("The MyGeotab server or database name could not be worked out for this page, so the Replay links will not work. Everything else in the report is unaffected.");
     }

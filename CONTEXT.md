@@ -89,6 +89,31 @@ Per device:
 `IDLE_SPEED_KMH = 1` matches Geotab's own definition of idling: speed below
 1 km/h with the ignition on.
 
+## Row sampling (v1.2.0)
+
+Geotab devices log every 10 to 60 seconds. The customer's reference report sits
+around 1 to 3 minutes apart, so one row per GPS log is denser than the thing being
+replicated. The toolbar has a spacing picker: every GPS log, or a row roughly
+every 1, 2, 3 or 5 minutes. **Default is 1 minute.**
+
+`thinRows()` runs at the end of `buildActivity`, after the status engine and after
+the day total is taken. What that ordering buys:
+
+- **Distance still accumulates over every log.** The Daily distance column is the
+  cumulative value at that row, so dropping intermediate rows leaves the numbers
+  correct and still ending on the day total.
+- **Idling is still measured start to end**, not between surviving rows.
+- **Every status change survives.** Only `Moving` and `Idling` continuation rows
+  are candidates for dropping. Ignition on, Ignition off, Idling start and Idling
+  end are always kept, as is the last row of the day.
+
+Sampling also happens **before** geocoding, so a 1-minute floor cuts `GetAddresses`
+volume by roughly the same factor it cuts rows.
+
+Nothing is hidden silently: a notice states the spacing and what it does not
+affect, and a sampled day's total line reads `42 of 310 logs` rather than
+`42 events`.
+
 ## Known limits and things to verify
 
 - **Ignition off rows are unverified.** The customer's reference screenshot is
@@ -150,6 +175,18 @@ segment. The trip matching is correct.
 Rows with no containing trip (idling with the ignition on between trips) fall
 back to the timestamp plus or minus 15 minutes (`REPLAY_PAD_MS`). Whether the
 page accepts an arbitrary window rather than real trip boundaries is untested.
+
+### Replay in the exports (v1.2.0)
+
+Both exports carry the link.
+
+**PDF.** A Replay column, blue and bold, with a real PDF link annotation over each
+cell. A link in a PDF is a rectangle annotation rather than styled text, so it can
+only be drawn once the cell's final page position is known. That happens in
+autoTable's `didDrawCell`, against a per-table `pdfUrls` array, since
+`data.row.index` is table-relative and this report emits one table per day.
+
+**CSV.** A `Replay` column holding the raw URL. Excel and Sheets both linkify it.
 
 ### How this went wrong, so it does not repeat
 
@@ -292,7 +329,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.1.3`. Bump that query
+Cache note: the asset links are versioned with `?v=1.2.0`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 
