@@ -47,7 +47,47 @@ src/geotab-logo.png
 ```
 
 `styles.css` and `logo-data.js` are unmodified copies of the legacy-trip-report
-versions, so fixes can be mirrored between the two repos.
+versions, so fixes can be mirrored between the two repos. `smart-insights` has
+its own `styles.css` that has drifted elsewhere but still shares the card rules
+verbatim, so shared-component fixes go to all three. See below.
+
+### Summary card accent stripe (v1.6.2)
+
+The blue stripe on the summary cards did not line up with the card frame: at both
+top corners the stripe stopped short with a square cut while the grey border arc
+carried on past it, which reads as the two overlapping.
+
+It was drawn as an absolutely positioned `::before`, 3px tall, `left:0; right:0`,
+relying on the card's `overflow: hidden` to round it off. That can never line up.
+An absolutely positioned child is clipped to the **padding** box, whose corner
+radius is `10px - 1px border = 9px`, while the grey border draws the **10px outer**
+curve. A 3px-tall bar clipped by a 9px curve loses roughly 7px off each end, so
+the stripe physically cannot reach the corner the border is drawing.
+
+Fixed by making the stripe the card's own `border-top: 3px`. The browser then
+miters the thick top into the thin sides around one shared radius, so there is a
+single continuous curve and nothing left to misalign. `--accent-mid: #7FBEEA` is
+a new token equal to `--accent` at 50% over white, which is exactly what the old
+`opacity: .5` produced, so the colour is unchanged. Top padding dropped 16px to
+14px to absorb the 2px the thicker border adds, keeping card height identical.
+
+Applied to all three repos; the card block is byte-identical in each. Asset query
+strings were bumped in the same pass (`legacy-trip-report` to `?v=1.1.1`,
+`smart-insights` to `?v=2.7.1`), because without that the patched CSS never
+reaches a browser holding the old copy.
+
+**Verified by rendering, not by reading.** `.diag/cards.html` loads the real
+stylesheet with the real card markup; headless Chrome screenshots it at high
+device-scale so the corner is actually inspectable:
+
+```
+"/c/Program Files/Google/Chrome/Application/chrome.exe" --headless --disable-gpu \
+  --force-device-scale-factor=14 --hide-scrollbars \
+  --screenshot=.diag/corner.png --window-size=46,22 file:///.../.diag/cards.html
+```
+
+Use this for any future CSS change to these cards. Reasoning about clipping and
+border-radius from the source is what produced the bug in the first place.
 
 ## Namespacing (important)
 
@@ -675,7 +715,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.6.1`. Bump that query
+Cache note: the asset links are versioned with `?v=1.6.2`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 

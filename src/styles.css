@@ -4,6 +4,7 @@
 :root {
   --accent:        #0078D4;
   --accent-dim:    #E8F4FD;
+  --accent-mid:    #7FBEEA;
   --accent-dark:   #005A9E;
   --surface:       #ffffff;
   --surface-2:     #f8f9fb;
@@ -606,23 +607,25 @@ body {
   margin-bottom: 18px;
 }
 
+/* The accent stripe is the card's own top border, not a bar layered over it.
+   As a stacked ::before it could never line up: an absolutely positioned child
+   is clipped by overflow:hidden to the PADDING box, whose corner radius is
+   10px - 1px border = 9px, while the grey border draws the 10px OUTER curve.
+   A 3px-tall bar clipped by a 9px curve loses roughly 7px off each end, so the
+   stripe stopped short with a square cut while the grey arc carried on past it.
+   That mismatch at both top corners is what read as the frame overlapping.
+   Drawn as a border instead, the browser miters the 3px top into the 1px sides
+   around one shared radius, so there is a single continuous curve to misalign.
+   --accent-mid is --accent at 50% over white, which is what opacity:.5 gave. */
 .summary-card {
   background: var(--surface);
   border: 1px solid var(--border);
+  border-top: 3px solid var(--accent-mid);
   border-radius: var(--radius);
-  padding: 16px 18px;
+  padding: 14px 18px 16px;   /* top trimmed by the 2px the thicker border adds */
   box-shadow: var(--shadow-sm);
   position: relative;
   overflow: hidden;
-}
-
-.summary-card::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 3px;
-  background: var(--accent);
-  opacity: .5;
 }
 
 .summary-label {
