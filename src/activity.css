@@ -185,6 +185,20 @@
 .val-dot-ignon    { background: var(--accent); }
 .val-dot-ignoff   { background: var(--text-muted); }
 
+/* A vehicle that reported all range but never switched on. Quiet, not alarming:
+   nothing went wrong and nothing is missing. It is bordered rather than plain so
+   it still reads as a deliberate statement about the vehicle instead of an empty
+   space where a table failed to appear. */
+.val-parked {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.val-parked-where { margin-top: 5px; color: var(--text-muted); font-size: 12px; }
+
 .val-coords { font-family: "Cascadia Code", Consolas, monospace; font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
 .val-muted  { color: var(--text-muted); }
 .val-num    { font-variant-numeric: tabular-nums; white-space: nowrap; }

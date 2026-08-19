@@ -26,7 +26,7 @@
   // fmtSpeed. Do not convert earlier or thresholds start disagreeing with data.
   // Stamped into the copied diagnostics, so a pasted failure report says which
   // build produced it. Keep in step with index.html and config.json.
-  var APP_VERSION     = "1.8.0";
+  var APP_VERSION     = "1.8.1";
 
   var IDLE_SPEED_KMH  = 1;
   var IDLE_RESUME_KM  = 0.05;   // 50 m of ground covered ends a stop
@@ -879,10 +879,30 @@
       return Math.abs(a.ms - ms) <= Math.abs(b.ms - ms) ? a : b;
     }
 
-    // Collapse the ignition records into real state changes. Boundary records
-    // seed the starting state and are never emitted: see fetchIgnition.
+    // Collapse the ignition records into real state changes. Records that
+    // describe the state entering the window seed it and are never emitted.
+    //
+    // A record is a seed if it has no id (a boundary record MyGeotab
+    // manufactures at the window edge) OR if it is timestamped before the window
+    // opens. The id test alone is not enough, and assuming it was is what put a
+    // row dated the previous day into a report about today.
+    //
+    // What actually happens: when the ignition never changes inside the window,
+    // MyGeotab does not manufacture a boundary at all. It returns the last real
+    // change from BEFORE the window, id, version and original timestamp intact.
+    // Verified on ILLE01, device bA: a query for 19 Aug 2026 returns exactly one
+    // record, id b338397, dated 2026-08-18T17:36:07Z, six hours before the window
+    // opens. Treated as a real transition it became an "Ignition off" row dated
+    // 18 Aug, under a day heading for 18 Aug, in a report the operator had asked
+    // to cover 19 Aug. The vehicle had simply parked the evening before and not
+    // moved since.
+    //
+    // Judging by timestamp is the safer rule anyway: it does not care how
+    // MyGeotab chose to mark the record, only whether the event falls in the
+    // range the operator asked for.
     var transitions = [];
     var seedIgn = null;
+    var fromMs = new Date(fromIso).getTime();
     var hasIgnition = ignitionRecs !== null && ignitionRecs.length > 0;
     if (hasIgnition) {
       var sorted = ignitionRecs.slice().sort(function (a, b) {
@@ -890,17 +910,18 @@
       });
       var last = null, sawReal = false;
       sorted.forEach(function (r) {
-        var on = Number(r.data) >= 0.5;
+        var on  = Number(r.data) >= 0.5;
+        var rMs = new Date(r.dateTime).getTime();
         var changed = (last === null || on !== last);
         last = on;
-        if (!r.id) {
-          // Only the opening boundary is a seed. The closing one restates a
+        if (!r.id || rMs < fromMs) {
+          // Only the opening state is a seed. The closing boundary restates a
           // state we already know and would otherwise overwrite it.
           if (!sawReal && seedIgn === null) seedIgn = on;
           return;
         }
         sawReal = true;
-        if (changed) transitions.push({ t: r.dateTime, ms: new Date(r.dateTime).getTime(), on: on });
+        if (changed) transitions.push({ t: r.dateTime, ms: rMs, on: on });
       });
     }
 
@@ -1114,7 +1135,17 @@
     // every GPS log and idling is still measured start to end.
     reduceRows(days, S.rules);
 
-    return { days: days, hasIgnition: hasIgnition };
+    // realLogs and lastPt let the caller tell the two silent outcomes apart. No
+    // rows because the vehicle sat still with the engine off is a fact worth
+    // printing; no rows because nothing came back is a failure. Both used to
+    // look identical from outside this function, so the parked vehicle was
+    // simply dropped from the report and the operator was left to wonder.
+    return {
+      days: days,
+      hasIgnition: hasIgnition,
+      realLogs: realPts.length,
+      lastPt: realPts.length ? realPts[realPts.length - 1] : null
+    };
   }
 
   // A device reporting every 10 to 60 seconds produces far more rows than the
@@ -1477,6 +1508,42 @@
       + "</div>";
   }
 
+  // A vehicle that reported its position all day but never switched on. It has
+  // no rows, because rows are events and nothing happened, but leaving it out
+  // is the wrong answer: an operator scanning the report cannot tell a vehicle
+  // that stood still from one the report failed to load. Silence is the failure
+  // mode this whole file has been fighting since v1.7.3.
+  //
+  // So it gets a block of its own that says what happened in words, with the
+  // count of GPS records behind the claim and the address it sat at. No table
+  // and no zero-filled totals, because there is nothing to tabulate and "0 km"
+  // in a distance column reads as a measurement rather than an absence.
+  function renderParkedDevice(dev) {
+    var block = document.createElement("div");
+    block.className = "val-vehicle-block";
+    var p = dev.lastPt;
+    var where = p ? (S.addrMap[coordKey(p.lat, p.lng)] || "") : "";
+
+    block.innerHTML = "<h3 class='val-vehicle-name'>" + esc(dev.name) + "</h3>"
+      + "<div class='val-parked'>"
+      + "<strong>No activity in this range.</strong> The vehicle reported "
+      + dev.realLogs.toLocaleString() + " GPS record" + (dev.realLogs === 1 ? "" : "s")
+      + " and the ignition never came on, so it was parked for the whole range "
+      + "rather than missing from the report."
+      + (p ? "<div class='val-parked-where'>Last position: "
+             + (where ? esc(where) + " " : "")
+             + "<span class='val-coords'>" + p.lat.toFixed(5) + ", " + p.lng.toFixed(5) + "</span>"
+             + "</div>"
+           : "")
+      + "</div>";
+
+    // Same insertion as renderDevice: above the progress line, so vehicles stay
+    // in the order they were requested as they stream in.
+    var out = $("val-output");
+    var progress = $("val-progress");
+    if (progress) out.insertBefore(block, progress); else out.appendChild(block);
+  }
+
   function renderDevice(dev) {
     var block = document.createElement("div");
     block.className = "val-vehicle-block";
@@ -1766,11 +1833,21 @@
       }
 
       var i = 0;
+      // Vehicles rendered as parked. They are not in S.devices, because they
+      // have no rows to export, but they are on screen, so the run did produce
+      // something and must not be overwritten with "No activity found".
+      var parkedCount = 0;
       (function next() {
         if (i >= devices.length) {
-          if (!S.devices.length) { finish("No activity found for that selection and date range."); return; }
-          $("val-csv").classList.remove("hidden");
-          $("val-pdf").classList.remove("hidden");
+          if (!S.devices.length && !parkedCount) {
+            finish("No activity found for that selection and date range.");
+            return;
+          }
+          // Nothing to put in a CSV or a PDF if every vehicle was parked.
+          if (S.devices.length) {
+            $("val-csv").classList.remove("hidden");
+            $("val-pdf").classList.remove("hidden");
+          }
           finish(null);
           return;
         }
@@ -1807,7 +1884,26 @@
             }
 
             var built = buildActivity(logs, ign, fromIso, toIso);
-            if (!built.days.length) { next(); return; }
+
+            // No rows, but the vehicle did report. It was parked, not missing.
+            // Say so on screen instead of dropping it. One address to resolve,
+            // reusing the same geocoder by handing it a rows-shaped stand-in.
+            if (!built.days.length) {
+              if (built.realLogs && built.lastPt) {
+                var lp = built.lastPt;
+                resolveAddresses([{ rows: [{ lat: lp.lat, lng: lp.lng }] }], function () {}, function () {
+                  renderParkedDevice({
+                    id: dev.id, name: dev.name,
+                    realLogs: built.realLogs, lastPt: lp
+                  });
+                  parkedCount++;
+                  next();
+                });
+                return;
+              }
+              next();
+              return;
+            }
 
             var entry = { id: dev.id, name: dev.name, days: built.days };
 

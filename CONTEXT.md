@@ -1010,9 +1010,17 @@ A `Get` on `LogRecord` or `StatusData` with a `fromDate`/`toDate` returns a
 manufactured record at **each end** of the window, carrying the state or
 position at that exact instant so a map can draw a continuous line to the edge.
 
-**They have no `id` and no `version`.** Real records have both. That is the only
-reliable way to tell them apart. Do not test the timestamp against the window
-edge: a genuine record can land on midnight.
+**They have no `id` and no `version`.** Real records have both. Do not test the
+timestamp against the window edge for equality: a genuine record can land on
+midnight.
+
+> **Corrected in v1.8.1: "no `id`" is not the whole rule for `StatusData`.**
+> When the ignition never changes inside the window, MyGeotab manufactures no
+> boundary at all. It returns the last real change from **before** the window,
+> `id`, `version` and original timestamp intact. See the v1.8.1 section below.
+> The code now treats a record as a seed if it has no `id` **or** is stamped
+> strictly before the window opens. Strictly before, so the midnight caveat
+> above still holds.
 
 Measured on ILLE01 device b19:
 
@@ -1111,6 +1119,91 @@ gap 6.8 minutes. Most short cycles are genuine (moving a van a few metres, a
 stall and restart). Only one, a 7 s off inside a 41 s on, looks like real bounce.
 A filter loose enough to catch it would delete genuine short trips. The event
 counts are high because this vehicle really does cycle its ignition a lot.
+
+## A parked vehicle looked like a failed pull (fixed in v1.8.1)
+
+**Reported:** a 19 Aug 2026 run showed `171 WX 2519 SPARE` with one row, an
+"Ignition off" dated **18/08/2026 18:36:07 BST**, under a day heading for
+18 Aug, 0 km, 0 events of interest, and no warning anywhere. It read as a failed
+fetch, and the obvious suspicion was call volume or a timeout.
+
+**It was not a failed fetch, and it was not volume.** Checked against the live
+API with `cli-mygeotab`, device `bA`, the exact window the add-in uses:
+
+```
+log record --from 2026-08-18T23:00:00Z --to 2026-08-19T22:59:59Z   ->  36 records
+  boundary 2026-08-18T23:00:00.000Z  52.3844566,-6.91724968  spd=0   (no id)
+  ...all 35 real records at the same coordinate, speed 0
+log status  --diagnostic-id DiagnosticIgnitionId  same window       ->   1 record
+  {"data":0,"dateTime":"2026-08-18T17:36:07.964Z","id":"b338397","version":"..."}
+```
+
+The vehicle parked at Talbot Hall, Arnestown, New Ross at 18:36 on 18 Aug and did
+not move for the whole of 19 Aug. 0 km is a fact about the vehicle. The add-in
+received everything there was to receive.
+
+**The bug is that one ignition record.** It is dated six hours *before* the
+window opens, and it carries a real `id` and `version`. So the v1.6.0 rule
+("boundary records have no id") did not catch it, and the engine treated it as a
+genuine transition: it started a day for 18 Aug, placed the event on the nearest
+log, and drew an "Ignition off" row in a report about 19 Aug.
+
+So MyGeotab has **two** behaviours at the window edge, not one:
+
+| Ignition changed inside the window? | What comes back |
+|---|---|
+| Yes | A manufactured boundary record, no `id`, stamped at the window edge |
+| No | The last real change from **before** the window, `id` and timestamp intact |
+
+**Fix:** judge by timestamp, not by `id`. A record is a seed if it has no `id`
+**or** is stamped strictly before `fromDate`. Strictly, so a genuine record
+landing exactly on midnight is still a real transition. This is the safer rule
+regardless: it does not care how MyGeotab chose to mark the record, only whether
+the event falls in the range the operator asked for.
+
+**Second fix: a parked vehicle must not vanish.** With the row gone, the vehicle
+produced no days and `runReport` dropped it from the report entirely. That is the
+worse bug of the two, and the same silence that cost this exact vehicle a day of
+driving in v1.7.3. `buildActivity` now also returns `realLogs` and `lastPt`, which
+let the caller tell "parked" from "the fetch failed", and `renderParkedDevice`
+prints a block saying so in words, with the record count behind the claim and the
+address it sat at. No table and no zero-filled totals: "0 km" in a distance column
+reads as a measurement, not an absence.
+
+`parkedCount` is tracked separately from `S.devices`, so a run where every vehicle
+was parked shows the blocks rather than "No activity found", and the CSV and PDF
+buttons stay hidden because there is nothing to export.
+
+**Verified:** `.diag/parked-test.js`, 27 assertions on the real API response,
+including a fixture guard that fails if the data is ever replaced with something
+that does not reproduce the bug. Reverting the one condition to the old `!r.id`
+test reproduces the screenshot exactly:
+
+```
+OLD CODE: days=1
+  day 2026-08-18  rows=1
+    2026-08-18T17:36:07.964Z  Ignition off  52.38446, -6.91725
+```
+
+The 18 Aug control is untouched: 1 day, 3905 rows, 429.71 km.
+
+### Volume and timeouts were the wrong suspect, and here is why
+
+Worth recording, because it is the natural first guess every time:
+
+- Vehicles are fetched **sequentially**, in `next()`. There is no fan-out, so a
+  run cannot burst against the rate limiter.
+- Every `Get` retries 4 times with 1 s, 3 s, 9 s backoff before giving up.
+- A `LogRecord` failure calls `addFailure`, which names the vehicle in the **red**
+  block above the results. Ignition and trip failures add named warnings. None of
+  those paths can silently drop a vehicle.
+
+**But warnings are easy to miss.** `renderWarnings` writes into a `<details>` that
+is collapsed at the start of every run and sits at the top of the page. On a long
+report the operator is scrolled far below it. The amber frame and the note count
+are the only signal, and neither is visible from the middle of the page. Nothing
+was hidden in this case, because there was nothing to warn about, but the next
+real warning will be just as easy to walk past. See the open items.
 
 ## Volume guards
 
