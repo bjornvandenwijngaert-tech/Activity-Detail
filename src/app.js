@@ -958,9 +958,9 @@
       : "Times are 24-hour in <code>this computer's timezone</code> <span class='val-muted'>(no profile timezone available)</span>";
 
     var host = (S.server && S.dbName)
-      ? "Replay links open <code>" + esc(S.server + "/" + S.dbName)
+      ? "Trip History links open <code>" + esc(S.server + "/" + S.dbName)
         + "</code> <span class='val-muted'>(host read from " + esc(S.hostVia || "session") + ")</span>"
-      : "Replay links are disabled: could not work out the MyGeotab server or database name for this page.";
+      : "Trip History links are disabled: could not work out the MyGeotab server or database name for this page.";
 
     var units = "Distances in <code>" + distUnit() + "</code>, speeds in <code>" + speedUnit() + "</code> "
       + "<span class='val-muted'>(" + (S.unitsVia ? "from " + esc(S.unitsVia) : "profile units not available, showing metric") + ")</span>";
@@ -974,7 +974,7 @@
   // page no longer reads, so it landed on an empty Trips History and looked like
   // a broken link rather than a missing host. Say so instead.
   function openReplay() {
-    alert("Could not work out the MyGeotab address for this database, so the Replay link cannot be built.");
+    alert("Could not work out the MyGeotab address for this database, so the Trip History link cannot be built.");
   }
 
   // Says how many rows are shown, and how many logs are behind them when the
@@ -986,7 +986,11 @@
   }
 
   // ─── Rendering ───────────────────────────────────────────────────────────
-  var COLS = ["Date", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Replay"];
+  // The customer's reference export labels the last column REPLAY. It is called
+  // "Trip History" here instead, singular, because the link opens one trip's
+  // playback rather than the multi-trip Trips History listing the plural name
+  // refers to. Flag the difference when the output is put next to their export.
+  var COLS = ["Date", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Trip History"];
 
   function renderDevice(dev) {
     var block = document.createElement("div");
@@ -1026,7 +1030,7 @@
           // what makes this diagnosable without a debugger.
           + "<td><a href='" + esc(url || "#") + "' target='_blank' rel='noopener' class='val-replay'"
           + " data-device='" + esc(dev.id) + "' data-time='" + esc(r.t) + "'"
-          + " title='" + esc(url || "No MyGeotab host resolved, so no Replay link could be built.") + "'>REPLAY</a></td>"
+          + " title='" + esc(url || "No MyGeotab host resolved, so no Trip History link could be built.") + "'>Trip History</a></td>"
           + "</tr>";
       });
 
@@ -1104,7 +1108,7 @@
     return out;
   }
 
-  var CSV_HEAD = ["Vehicle", "Date", "Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Replay"];
+  var CSV_HEAD = ["Vehicle", "Date", "Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Trip History"];
 
   function exportCsv() {
     if (!S.devices.length) { alert("Run the report first."); return; }
@@ -1162,7 +1166,7 @@
             fmtTime(r.t), r.status, r.duration, fmtDist(r.distKm),
             (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : fmtSpeed(r.speed),
             addressFor(r), r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
-            rUrl ? "REPLAY" : ""
+            rUrl ? "Trip History" : ""
           ]);
           pdfUrls.push(rUrl);
           emitted++;
@@ -1180,15 +1184,22 @@
 
         doc.autoTable({
           startY: yPos,
-          head: [["Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Replay"]],
+          head: [["Time", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Trip History"]],
           body: body,
           margin: { left: margin, right: margin },
           styles: { fontSize: 7.5, cellPadding: 1.6, textColor: [45, 55, 72], overflow: "linebreak" },
           headStyles: { fillColor: [0, 120, 212], textColor: 255, fontStyle: "bold", fontSize: 7.5 },
           columnStyles: {
+            // Every column is fixed except 5 (Location), which absorbs whatever
+            // is left of the 273 mm between the margins. "Trip History" at 7.5pt
+            // bold measures 14.9 mm, so column 7 needs 18.1 mm with the 1.6 mm
+            // padding either side. 21 mm leaves slack, because overflow is
+            // "linebreak": a cell 1 mm too narrow wraps at the space and makes
+            // every row in the table taller. The 5 mm over the old 16 mm comes
+            // out of Location, which had ~101 mm for a single address line.
             0: { cellWidth: 20 }, 1: { cellWidth: 22 }, 2: { cellWidth: 38 }, 3: { cellWidth: 24 },
             4: { cellWidth: 18 }, 6: { cellWidth: 34 },
-            7: { cellWidth: 16, textColor: [0, 120, 212], fontStyle: "bold" }
+            7: { cellWidth: 21, textColor: [0, 120, 212], fontStyle: "bold" }
           },
           // A PDF link is an annotation over a rectangle, not styled text, so it
           // has to be drawn once the cell's final position on the page is known.
@@ -1246,7 +1257,7 @@
     S.rules = activeRules($("val-detail").value);
     if (S.rules) addWarning(describeRules(S.rules));
     if (!resolveHost()) {
-      addWarning("The MyGeotab server or database name could not be worked out for this page, so the Replay links will not work. Everything else in the report is unaffected.");
+      addWarning("The MyGeotab server or database name could not be worked out for this page, so the Trip History links will not work. Everything else in the report is unaffected.");
     }
     renderLinkInfo();
     renderWarnings();

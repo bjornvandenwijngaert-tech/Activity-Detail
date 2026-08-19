@@ -5,11 +5,14 @@
 A standalone MyGeotab add-in report that reproduces a per-event vehicle activity
 report a customer brought over from a previous system. One row per GPS log, with
 a derived status, idling duration, running daily distance, spot speed, address,
-coordinates and a Replay link.
+coordinates and a link into MyGeotab.
 
 Reference columns, in order:
 
 `DATE | STATUS | DURATION | DAILY DISTANCE | SPEED | LOCATION | COORDINATES | REPLAY`
+
+The last column is labelled **Trip History** here, not REPLAY. That is the one
+deliberate difference from the reference export: see the naming note below.
 
 Statuses: Ignition on, Idling start, Idling, Idling end, Moving, Ignition off.
 
@@ -202,7 +205,46 @@ Nothing is hidden silently. Three things say so on screen:
   idling from GPS speed alone. A visible warning says so, because those totals
   will not match the native Idling report.
 
-## Replay link
+## Trip History link
+
+### What it is called, and why (v1.6.1)
+
+The customer's reference export heads this column `REPLAY`. It is **Trip History**
+here instead. Renamed on the colleague's call, and the reasoning is worth keeping:
+
+- Geotab's own page is **Trips History**, plural, because it lists many trips.
+  The button is scoped to the one trip containing the clicked row, so the label
+  is deliberately singular. It is not a typo, and it should not be "corrected"
+  to match the menu.
+- A user who clicks "Replay" and later wants that page again has no word to
+  search the Geotab menu for. "Trip History" gets them there.
+
+Against that, "Replay" was accurate about the landing state, since the URL sets
+`isReplayPlayerHidden:!f` and the playback control does open. That is now carried
+by the tooltip rather than the label.
+
+Changed in four user-facing places: the on-screen column and link text, the CSV
+header, and the PDF header and cell. The internal names (`replayUrl`,
+`.val-replay`, `REPLAY_PAD_MS`) were left alone, because they describe the
+mechanism, which is still the replay player, and renaming them would be churn
+across the one part of this file that took four versions to get right.
+
+The cell text reads `Trip History`, in the same case as its column header, not
+the all-caps `REPLAY` the reference export uses. The `.4px` tracking on
+`.val-replay` went with it: that was there to open up the capitals and only
+loosens mixed case.
+
+PDF column 7 went from 16 mm to 21 mm. `Trip History` at 7.5pt bold measures
+14.9 mm, so 18.1 mm is the true minimum with the 1.6 mm padding either side;
+21 mm is deliberate slack, because `overflow: "linebreak"` means a cell 1 mm too
+narrow wraps at the space and makes **every** row in the table taller. Every
+other column is fixed, so those 5 mm come out of Location, the only auto-sized
+column, which had roughly 101 mm for a single address line.
+
+**Flag this difference** during the side-by-side against the customer's export.
+It is the only column whose header does not match.
+
+### Building the URL
 
 **Do not use the SDK guide for this.** The examples in
 [Using MyGeotab URLs](https://developers.geotab.com/myGeotab/guides/myGeotabUrls/)
@@ -249,7 +291,7 @@ Rows with no containing trip (idling with the ignition on between trips) fall
 back to the timestamp plus or minus 15 minutes (`REPLAY_PAD_MS`). Whether the
 page accepts an arbitrary window rather than real trip boundaries is untested.
 
-### Replay in the exports (v1.2.0)
+### Trip History links in the exports (v1.2.0)
 
 Both exports carry the link.
 
@@ -612,7 +654,7 @@ group-wide run shows output while it is still working.
   its last GPS log and confirm that Ignition off appears, at its own time.
 - **Volume.** Run a group over a week; confirm the notices fire and the progress
   line moves rather than appearing to hang.
-- **Replay.** Click three rows from different days and confirm each lands on the
+- **Trip History links.** Click three rows from different days and confirm each lands on the
   right vehicle in the right window.
 - **Row triggers.** On Balanced, confirm the rows land roughly 1 to 3 minutes apart
   at road speed, and hover a few times to check the stated reason matches what the
@@ -633,7 +675,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.6.0`. Bump that query
+Cache note: the asset links are versioned with `?v=1.6.1`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 
