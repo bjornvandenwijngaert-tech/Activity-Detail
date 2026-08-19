@@ -487,9 +487,13 @@
   //   routes:(b11:!((start:'2026-08-18T21:14:40.557Z',stop:'2026-08-18T23:38:26.557Z')))
   //
   // What each part does:
-  //   routes                a map of device id to trip segments. This is what
-  //                         picks the vehicle AND draws the segment. It replaces
-  //                         entityType and selectedEntities entirely.
+  //   routes                a map of device id to trip segments. Draws the
+  //                         segment. Confirmed by testing that this does NOT on
+  //                         its own put the vehicle in the page's filter.
+  //   entityType /          the vehicle filter. Absent from the sample URL above,
+  //   selectedEntities      because that page already had the vehicle selected in
+  //                         the UI. Sent alongside routes rather than instead of
+  //                         it: they do different jobs.
   //   isReplayPlayerHidden  rison !f is false, so the replay player opens.
   //                         Without it the page shows a static route.
   //   dateRange             scopes the trip list. label is a UI convenience and
@@ -528,12 +532,19 @@
       segStop  = new Date(d.getTime() + REPLAY_PAD_MS).toISOString();
     }
 
-    var url = "https://" + S.server + "/" + S.dbName + "/#tripsHistory,"
-      + "dateRange:(endDate:'" + dayEnd.toISOString() + "',startDate:'" + dayStart.toISOString() + "'),";
-    if (cardId) url += "expandedCardIds:!('" + cardId + "'),";
-    url += "isReplayPlayerHidden:!f,"
-      + "routes:(" + deviceId + ":!((start:'" + segStart + "',stop:'" + segStop + "')))";
-    return url;
+    // Keys are emitted alphabetically, which is the order MyGeotab itself
+    // serialises them in. Order should not matter to a rison parser, but
+    // matching the app removes one variable while this is still being proven.
+    var parts = [
+      "dateRange:(endDate:'" + dayEnd.toISOString() + "',startDate:'" + dayStart.toISOString() + "')",
+      "entityType:Device"
+    ];
+    if (cardId) parts.push("expandedCardIds:!('" + cardId + "')");
+    parts.push("isReplayPlayerHidden:!f");
+    parts.push("routes:(" + deviceId + ":!((start:'" + segStart + "',stop:'" + segStop + "')))");
+    parts.push("selectedEntities:!(" + deviceId + ")");
+
+    return "https://" + S.server + "/" + S.dbName + "/#tripsHistory," + parts.join(",");
   }
 
   // Where the MyGeotab host comes from, best source first.

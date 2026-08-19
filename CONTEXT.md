@@ -131,6 +131,12 @@ routes:(b11:!((start:'2026-08-18T21:14:40.557Z',stop:'2026-08-18T23:38:26.557Z')
 | `dateRange` | Scopes the trip list. `label` is a UI convenience, omitted since explicit dates are supplied. | Yes, row's local day |
 | `expandedCardIds` | Opens the matching trip card in the side list. `<deviceId>_<driverId>_<Ddd+Mmm+D>`, spaces as `+`. | Yes, when a trip matched |
 | `mapBounds` | Viewport only. | No, so the map fits the route |
+| `entityType` + `selectedEntities` | The vehicle filter. **Absent from the sample URL**, because that page already had the vehicle picked in the UI. | Yes, restored in v1.1.2 |
+
+v1.1.0 dropped `entityType` / `selectedEntities` on the theory that `routes`
+replaced them. Testing v1.1.1 disproved that: the date filtered, the vehicle did
+not. They do different jobs, so v1.1.2 sends both. Keys are emitted
+alphabetically, matching MyGeotab's own serialisation order.
 
 ### Why Trip is now fetched
 
@@ -274,7 +280,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.1.1`. Bump that query
+Cache note: the asset links are versioned with `?v=1.1.2`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 
