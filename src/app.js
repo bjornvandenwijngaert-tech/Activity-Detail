@@ -26,7 +26,7 @@
   // fmtSpeed. Do not convert earlier or thresholds start disagreeing with data.
   // Stamped into the copied diagnostics, so a pasted failure report says which
   // build produced it. Keep in step with index.html and config.json.
-  var APP_VERSION     = "1.7.4";
+  var APP_VERSION     = "1.8.0";
 
   var IDLE_SPEED_KMH  = 1;
   var IDLE_RESUME_KM  = 0.05;   // 50 m of ground covered ends a stop
@@ -720,10 +720,12 @@
     }, function (recs) { cb(recs || []); }, function () { cb(null); });
   }
 
-  // Trips are fetched only to build Replay links. The Trips History page keys
-  // its replay off a trip's exact start and stop, so a row can only deep-link
-  // into the replay if we know which trip contains it. One extra Get per
-  // vehicle; the report itself does not use this data.
+  // The Trips History page keys its replay off a trip's exact start and stop,
+  // so a row can only deep-link into the replay if we know which trip contains
+  // it. One extra Get per vehicle, which splitIdle then reuses to tell idling
+  // while stopped apart from idling in traffic, so the call earns its keep
+  // twice. If it fails the report still renders: links fall back to a plain
+  // date window and the idling total simply is not split.
   function fetchTrips(deviceId, fromIso, toIso, cb) {
     apiCall("Get", {
       typeName: "Trip",
@@ -742,7 +744,12 @@
       });
       out.sort(function (a, b) { return a.startMs - b.startMs; });
       cb(out);
-    }, function () { cb([]); });
+      // null for a failed call, [] for a vehicle that genuinely made no trips.
+      // Collapsing the two is the mistake that cost 171 WX 2519 SPARE a day of
+      // driving in v1.7.3: an empty array reads as a fact about the vehicle when
+      // it was really a fact about the request. Here it would silently drop the
+      // idling split and the deep links with no explanation on screen.
+    }, function () { cb(null); });
   }
 
   // Trips are sorted and do not overlap, so a binary search is enough.
@@ -755,6 +762,57 @@
       else return trips[mid];
     }
     return null;
+  }
+
+  // Splits each day's idling into time spent stopped and time spent standing
+  // still mid-journey, using the trips already fetched for the Replay links.
+  //
+  // Why bother: MyGeotab itself reports idling two different ways and neither
+  // is this total. The Trips History Idle column counts only the engine-on part
+  // of the stop AFTER a trip ends, so it misses every pause in traffic and any
+  // running before the day's first trip. The stock Idling exception rule counts
+  // ignition-on-and-not-driving anywhere, but only past a 3 minute 21 second
+  // floor, so it misses all the short ones. Measured on one vehicle for one day
+  // those give 26.57 and 29.99 minutes against our 56.21. Ours is not wrong, it
+  // is unfiltered, and an operator holding the native report next to this one
+  // needs the breakdown to see why the totals differ.
+  //
+  // The two halves also answer different questions. Time stopped with the
+  // engine running is a driver habit and burns fuel for nothing. Time standing
+  // still mid-journey is congestion and says something about the route.
+  //
+  // Minutes are attributed by overlap, so a run that straddles a trip boundary
+  // is divided rather than assigned whole. Rows are tagged by whichever side
+  // holds most of their run, because a single run reading as two colours part
+  // way down the table would look like a fault rather than a nuance.
+  function splitIdle(days, trips) {
+    if (!trips.length) return;   // nothing to classify against; leave untagged
+    days.forEach(function (day) {
+      var drive = 0, stop = 0;
+      (day.idleRuns || []).forEach(function (run) {
+        var within = 0;
+        for (var i = 0; i < trips.length; i++) {
+          var lo = Math.max(run.startMs, trips[i].startMs);
+          var hi = Math.min(run.endMs,   trips[i].stopMs);
+          if (hi > lo) within += hi - lo;
+        }
+        var total = run.endMs - run.startMs;
+        drive += within / 60000;
+        stop  += (total - within) / 60000;
+        run.cls = within * 2 > total ? "idledrive" : "idlestop";
+      });
+      day.idleDriveMins = drive;
+      day.idleStopMins  = stop;
+
+      day.rows.forEach(function (r) {
+        if (r.cls !== "idle") return;
+        var ms = new Date(r.t).getTime();
+        for (var i = 0; i < day.idleRuns.length; i++) {
+          var run = day.idleRuns[i];
+          if (ms >= run.startMs && ms <= run.endMs) { r.cls = run.cls; return; }
+        }
+      });
+    });
   }
 
   // ─── Status engine ───────────────────────────────────────────────────────
@@ -858,7 +916,7 @@
       // Close the previous day on the running total rather than on its last
       // row, because the last row of a day can precede its last GPS log.
       if (day) day.distKm = cumKm;
-      day = { dayKey: key, rows: [], distKm: 0, idleMins: 0 };
+      day = { dayKey: key, rows: [], distKm: 0, idleMins: 0, idleRuns: [] };
       days.push(day);
       curDayKey = key;
       cumKm = 0;
@@ -866,6 +924,19 @@
       inIdle = false;
       pend = null;   // same pre-existing gap as inIdle: an idle open across
                      // local midnight is abandoned rather than split
+    }
+
+    // Every idle run is recorded, not just added to the total, because the day
+    // total on its own cannot be split into idling while stopped and idling in
+    // traffic. That split needs the trip list, which arrives after this engine
+    // has finished. Keeping the runs is what lets splitIdle do the attribution
+    // later without re-deriving anything.
+    function closeIdle(endMs) {
+      var mins = (endMs - idleStartMs) / 60000;
+      day.idleMins += mins;
+      day.idleRuns.push({ startMs: idleStartMs, endMs: endMs });
+      inIdle = false;
+      return mins;
     }
 
     // A stop is not over the first time GPS reports 1 km/h. A vehicle standing
@@ -894,9 +965,7 @@
     // for a departure with no jitter.
     function confirmPending() {
       var b = pend.buf, first = b[0];
-      var mins = (first.ms - idleStartMs) / 60000;
-      day.idleMins += mins;
-      inIdle = false;
+      var mins = closeIdle(first.ms);
       pushAt(first.t, "Idling end", "idle", first,
              "Idling time: [" + fmtDurPrecise(mins) + "]", true);
       for (var k = 1; k < b.length; k++) pushAt(b[k].t, "Moving", "moving", b[k], "", true);
@@ -943,9 +1012,7 @@
           pushAt(tr.t, "Ignition on", "ignon", at, "", false);
         } else {
           if (inIdle) {
-            var im = (tr.ms - idleStartMs) / 60000;
-            day.idleMins += im;
-            inIdle = false;
+            var im = closeIdle(tr.ms);
             pushAt(tr.t, "Idling end", "idle", at, "Idling time: [" + fmtDurPrecise(im) + "]", false);
           }
           pushAt(tr.t, "Ignition off", "ignoff", at, "", false);
@@ -1005,7 +1072,7 @@
       var lastPt = realPts[realPts.length - 1];
       var openMins = (lastPt.ms - idleStartMs) / 60000;
       if (openMins > 0) {
-        day.idleMins += openMins;
+        closeIdle(lastPt.ms);
         day.rows.push({
           t: lastPt.t, status: "Idling end", cls: "idle",
           duration: "Idling time: [" + fmtDurPrecise(openMins) + "] (still idling at end of range)",
@@ -1358,6 +1425,34 @@
   // refers to. Flag the difference when the output is put next to their export.
   var COLS = ["Date", "Status", "Duration", "Daily distance", "Speed", "Location", "Coordinates", "Trip History"];
 
+  // The insight line under each day. Deliberately not a column: the split is
+  // one fact about the day, not a property of any single row, and an eighth
+  // column would crowd the table for something read once.
+  //
+  // The wording carries the meaning on its own. Colour agrees with the dots in
+  // the rows above so the eye can connect the two, but nothing here depends on
+  // being able to tell the colours apart.
+  // Same split as one plain line, for the exports, where there are no dots to
+  // colour and the words have to do all of the work.
+  function idleSplitText(d) {
+    if (d.idleStopMins == null || d.idleMins < 0.5) return "";
+    return fmtDurWhole(d.idleStopMins) + " stopped with the engine running, "
+         + fmtDurWhole(d.idleDriveMins) + " standing still mid-journey";
+  }
+
+  function idleSplitHtml(d) {
+    if (d.idleStopMins == null || d.idleMins < 0.5) return "";
+    var stopPct = Math.round(100 * d.idleStopMins / d.idleMins);
+    return "<div class='val-insight'>"
+      + "<span class='val-ins val-ins-stop'>" + esc(fmtDurWhole(d.idleStopMins))
+      + " stopped with the engine running</span>"
+      + "<span class='val-ins val-ins-drive'>" + esc(fmtDurWhole(d.idleDriveMins))
+      + " standing still mid-journey</span>"
+      + "<span class='val-ins-note'>" + stopPct + "% of the idling happened while parked. "
+      + "MyGeotab's Trips History counts only that part.</span>"
+      + "</div>";
+  }
+
   function renderDevice(dev) {
     var block = document.createElement("div");
     block.className = "val-vehicle-block";
@@ -1403,7 +1498,8 @@
       body += "<tr class='val-day-total'>"
         + "<td colspan='3'>" + esc(fmtDayReadable(d.dayKey)) + " total</td>"
         + "<td class='val-num'>" + esc(fmtDist(d.distKm)) + "</td>"
-        + "<td colspan='4'>" + esc(fmtDurWhole(d.idleMins)) + " idling &middot; " + esc(eventCount(d)) + "</td>"
+        + "<td colspan='4'>" + esc(fmtDurWhole(d.idleMins)) + " idling &middot; " + esc(eventCount(d))
+        + idleSplitHtml(d) + "</td>"
         + "</tr>";
 
       html += "<div class='val-table-wrap'><table class='dd-table'><thead><tr>"
@@ -1533,6 +1629,17 @@
           { content: "", styles: { fillColor: [245, 245, 245] } },
           { content: "", styles: { fillColor: [245, 245, 245] } }
         ]);
+        // The insight line, spanning the table. No colour: a printed report is
+        // often black and white, so this carries the split in words alone.
+        var splitLine = idleSplitText(d);
+        if (splitLine) {
+          body.push([{
+            content: splitLine,
+            colSpan: 8,
+            styles: { fontStyle: "italic", fontSize: 7, textColor: [90, 98, 112],
+                      fillColor: [250, 250, 250] }
+          }]);
+        }
 
         doc.autoTable({
           startY: yPos,
@@ -1681,13 +1788,22 @@
             var entry = { id: dev.id, name: dev.name, days: built.days };
 
             // Attach the containing trip to every row, so the Replay link can
-            // carry that trip's exact start and stop.
+            // carry that trip's exact start and stop, then use the same trips
+            // to split the day's idling into stopped and in traffic.
             fetchTrips(dev.id, fromIso, toIso, function (trips) {
+              if (trips === null) {
+                addWarning("Trips could not be read for " + dev.name + " after four attempts. " +
+                  "Its idling total is still correct, but it is not split into time stopped and " +
+                  "time standing still mid-journey, and its Trip History links open a date window " +
+                  "rather than the exact trip.");
+                trips = [];
+              }
               if (trips.length) {
                 built.days.forEach(function (day) {
                   day.rows.forEach(function (r) { r.trip = tripAt(trips, new Date(r.t).getTime()); });
                 });
               }
+              splitIdle(built.days, trips);
 
               setProgress("Resolving addresses for " + dev.name + "...");
               resolveAddresses(built.days, function (done, total) {

@@ -89,6 +89,155 @@ device-scale so the corner is actually inspectable:
 Use this for any future CSS change to these cards. Reasoning about clipping and
 border-radius from the source is what produced the bug in the first place.
 
+### Idling is not over-counted. It counts something wider than Geotab does
+
+**The suspicion was wrong.** Every previous entry here assumed the 56.2 min against
+Geotab's 00:26:34 was phantom idle produced by the sub-1 km/h threshold, and that the
+fix was calibration. It is not. Measured on 19 Aug 2026 with `.diag/idle-compare.js`,
+device `bA`, 18 Aug, against the 16 real `Trip` records:
+
+| Our idle time | Minutes | What it is |
+|---|---|---|
+| Inside a trip's stop window | 26.88 | Parked between trips with the engine running |
+| Inside a trip, start to stop | 23.74 | Stationary while on a trip: traffic, junctions, lights |
+| Before the first trip began | 5.59 | Engine on at 06:38:22, first trip started 06:43:58 |
+| **Total** | **56.20** | |
+
+Geotab's summed `idlingDuration` over the same 16 trips is **26.57 min**, and Trips
+History shows 00:26:34. Our first line is **26.88**. Those agree.
+
+Lined up stop window by stop window, every single trip matches to 0.1 min:
+
+```
+  stop..next            stopDur   gIdle    ours    diff
+  07:48:55..08:13:19      24.4    24.4    24.4+    0.0
+  08:22:07..08:36:18      14.2     0.1     0.1+    0.0
+  09:19:29..10:09:59      50.5     0.1     0.1+    0.0
+  ... all 16, none off by more than 0.2
+```
+
+**So there is no arithmetic error. The two numbers measure different things.**
+Geotab's `Trip.idlingDuration` is the engine-on portion of the stop **after** a trip
+ends. It does not count stationary time during a trip. Ours counts every stationary
+moment with the engine running, wherever it falls. Note trip 1: `stopDuration` 5:15 but
+`idlingDuration` 2 seconds, because the engine was off for nearly all of that stop.
+Geotab is measuring engine-on-while-parked, not stopped-ness.
+
+**The extra 23.74 min is the thing the customer asked for.** It is 49 in-trip pauses,
+median 16 seconds, 9 over 45 seconds, 2 over 2 minutes, longest 2.6 minutes. That is
+the red-light and traffic idling the whole v1.7.2 conversation was about. Removing it
+to match MyGeotab would delete the feature.
+
+**Consequence: do not "fix" this by tuning thresholds.** The sweep in
+`.diag/idle-sweep.js` shows why nothing in that direction works. Varying the speed
+threshold from 0.1 to 3 km/h moves the total between 56.2 and 58.0. Turning the v1.7.2
+coalescing off entirely gives 50.4. Dropping every run under 3 minutes gives 32.8. None
+of them approach 26.6 without also destroying the short-idle detail, because the gap
+was never made of short idles: two runs alone (24.8 min and 8.0 min) are 33 of the 56.
+
+**MyGeotab reports idling in two places and they do not agree with each other.**
+Checked live in ILLE01 on 19 Aug 2026. Besides the Trips History column there is the
+stock `Idling` exception rule, `RuleIdlingId`, active from 9 Jul 2026 on GroupCompanyId.
+Its condition tree:
+
+```
+DurationLongerThan 201 s
+  And
+    IsDriving == 0
+    And
+      DurationBetweenGps < 201 s      (GPS still reporting, not a dead zone)
+      Ignition == 1
+```
+
+So it fires on ignition-on, not-driving, for longer than **3 minutes 21 seconds**. For
+`bA` on 18 Aug it produced exactly two events:
+
+```
+  06:38:22 .. 06:43:58    5.59 min     (before the first trip)
+  07:48:55 .. 08:13:19   24.40 min     (the long parked stop)
+                        ------
+                         29.99 min
+```
+
+Both align with our runs to the second. So there are three native-or-derived figures for
+one vehicle-day, and all three are defensible:
+
+| Source | Minutes | What it excludes |
+|---|---|---|
+| Trips History `Idle` column | 26.57 | Anything not in a post-trip stop, including the 5.59 min warm-up |
+| `Idling` exception rule | 29.99 | Anything under 3 min 21 s |
+| This add-in | 56.21 | Nothing |
+
+The 201 s floor is why the rule misses 26 minutes that we catch. It is a fuel-waste
+alarm, not a measurement. **Do not treat either native number as the correct answer that
+we are deviating from.** Bjorn's stated intent is "how long a car is kept on after
+standing still", plus visibility of short repeated stops for route and driver efficiency.
+Only the 56.21 answers that.
+
+Untested on this day: whether the rule's `IsDriving == 0` would catch a long pause
+*inside* a trip. The longest in-trip pause on 18 Aug was 2.6 min, under the 201 s floor,
+so nothing distinguishes the two readings. Needs a vehicle that sat over 3:21 in traffic.
+
+**Fixed in v1.8.0: the split is shown as a per-day insight, not a column.** The problem
+was never the number, it was that one unexplained figure sat next to a different native
+one. `splitIdle` divides each day's idling into time stopped and time standing still
+mid-journey, and the day total row carries the breakdown in words.
+
+It costs nothing. `fetchTrips` was already running per vehicle to build the Trip History
+deep links, so the trip boundaries were on hand the whole time. **The earlier note in this
+file claiming it needed one extra `Get` per device was wrong.** The duration-threshold
+proxy was never needed either.
+
+How it works:
+
+- `buildActivity` now records every idle run in `day.idleRuns` as well as adding to
+  `day.idleMins`. It has to: the split is only knowable once the trip list arrives, which
+  is after the engine has finished, and a total cannot be divided after the fact.
+- `closeIdle(endMs)` replaced three separate hand-rolled `day.idleMins +=` sites. They had
+  drifted into three copies of the same three lines.
+- `splitIdle(days, trips)` attributes minutes **by overlap**, so a run straddling a trip
+  boundary is divided rather than assigned whole.
+- Rows are tagged by whichever side holds most of their run, not per row. Tagging per row
+  would flip the last row of a stop to the in-traffic colour, because an `Idling end`
+  lands exactly on the departure and so falls inside the trip that just started. One run
+  changing colour part way down the table looks like a fault.
+- With no trips the split is left `undefined`, not zero, so the UI hides the line instead
+  of asserting a false 0.
+
+Verified by `.diag/split-test.js`, 24 assertions, at all four detail levels: distance
+429.71 km and idle 56.20 min unchanged, stopped 32.47, mid-journey 23.74, halves summing
+to the total. `engine-harness.js` row counts identical at every level. `retry-test.js`
+still 37/37.
+
+**Colour choice is a constraint, not a preference. Bjorn is colour blind.** The two kinds
+of idling use `#0072B2` blue and `#E69F00` orange, the Okabe-Ito colour-blind safe pair.
+They separate on the blue-yellow axis rather than the red-green one, so they stay distinct
+under the common forms. Neither is red or green: idling in traffic is not the driver's
+fault and must not be coloured as a fault. Note `--warning` amber was already the idle dot
+colour, so do not reintroduce amber here or the two meanings collide.
+
+**Colour is never the only channel.** Stopped is a solid disc, mid-journey is a ring
+(`box-shadow: inset 0 0 0 3px`). The wording in the insight line states the split outright,
+and the PDF export prints it as plain italic text with no colour at all, because these get
+printed in black and white. If you touch this, keep the redundancy.
+
+**Tooling.** `.diag/idle-compare.js` needs `bA_trips.json` alongside the log and
+ignition pulls:
+
+```
+cli-mygeotab trip list --device-id bA --from 2026-08-17T23:00:00Z --to 2026-08-18T23:00:00Z -o json --quiet
+```
+
+PowerShell's `Out-File -Encoding utf8` writes a BOM on 5.1 and `JSON.parse` rejects it;
+the loader strips it. `.diag/load-app.js` can override any top-level `var NAME = value`
+constant in app.js before evaluating, which is how the sweep tests alternative
+thresholds against the real engine instead of a reimplementation that might disagree.
+
+Note when reading rows in a diagnostic: rows carry `t` (ISO) but **not** `ms`.
+`reduceRows` adds `ms`, and at the `all` level it returns early, so parse `t` yourself.
+Reading `r.ms` there silently yields NaN, every comparison goes false, and the script
+reports zeroes that look like a finding.
+
 ### A failed fetch rendered as "0 km" (v1.7.3, actually fixed in v1.7.4)
 
 **Symptom.** 171 WX 2519 SPARE, 18 Aug 2026: the report showed one row (an
