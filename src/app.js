@@ -56,15 +56,23 @@
   //   minGapMs    floor: never two rows closer than this, so a roundabout does
   //               not produce six rows in ten seconds. Status changes ignore
   //               the floor.
+  //   minIdleMs   an idle run shorter than this writes no rows at all at this
+  //               level. Status changes bypass minGapMs, which is why a car
+  //               creeping through 1 km/h for two seconds still produced an
+  //               Idling start and an Idling end on Balanced. Below this
+  //               length we do not believe it was a stop: it is a junction, a
+  //               speed bump, or GPS noise at walking pace. The time is still
+  //               counted in the day total, so the headline idling figure is
+  //               the same whichever level is picked. Only the rows differ.
   //
   // Each level carries a metric and an imperial pair rather than one pair that
   // gets converted. Converting 1.5 km would put "0.9 mi" in front of an imperial
   // user, which reads like a rounding artefact. These are round numbers in both
   // systems and close enough to each other that the output density matches.
   var DETAIL_LEVELS = {
-    key:      { metric: { dist: 5,   speed: 30 }, imperial: { dist: 3,   speed: 20 }, headingDeg: 90, maxGapMs: 900000, minGapMs: 60000 },
-    balanced: { metric: { dist: 1.5, speed: 20 }, imperial: { dist: 1,   speed: 12 }, headingDeg: 45, maxGapMs: 300000, minGapMs: 30000 },
-    detailed: { metric: { dist: 0.5, speed: 10 }, imperial: { dist: 0.3, speed: 6  }, headingDeg: 30, maxGapMs: 120000, minGapMs: 15000 },
+    key:      { metric: { dist: 5,   speed: 30 }, imperial: { dist: 3,   speed: 20 }, headingDeg: 90, maxGapMs: 900000, minGapMs: 60000, minIdleMs: 180000 },
+    balanced: { metric: { dist: 1.5, speed: 20 }, imperial: { dist: 1,   speed: 12 }, headingDeg: 45, maxGapMs: 300000, minGapMs: 30000, minIdleMs: 60000  },
+    detailed: { metric: { dist: 0.5, speed: 10 }, imperial: { dist: 0.3, speed: 6  }, headingDeg: 30, maxGapMs: 120000, minGapMs: 15000, minIdleMs: 0      },
     all:      null
   };
 
@@ -81,7 +89,8 @@
       speedLabel: u.speed + " " + speedUnit(),
       headingDeg: L.headingDeg,
       maxGapMs:   L.maxGapMs,
-      minGapMs:   L.minGapMs
+      minGapMs:   L.minGapMs,
+      minIdleMs:  L.minIdleMs
     };
   }
 
@@ -326,11 +335,25 @@
     renderWarnings();
   }
 
+  // A <details> rather than an always-open panel: on most runs the only entry is
+  // the row-emission explanation, which is worth reading once and not on every
+  // run. Collapsed it is one line; the yellow frame still marks it as something
+  // to look at. The count is in the header on purpose, so a run that produced a
+  // real warning (missing ignition data, a truncated fetch) is visibly different
+  // from a routine one without having to open it.
+  //
+  // Nothing sets `open` here. The browser keeps the attribute across an innerHTML
+  // change, so a panel the operator opened mid-run stays open as later warnings
+  // arrive. It is reset to closed once per run, where S.warnings is cleared.
   function renderWarnings() {
     var el = $("val-notice");
     if (!S.warnings.length) { el.classList.add("hidden"); el.innerHTML = ""; return; }
-    el.innerHTML = "<strong>Please note</strong><ul>" +
-      S.warnings.map(function (w) { return "<li>" + esc(w) + "</li>"; }).join("") + "</ul>";
+    var n = S.warnings.length;
+    el.innerHTML = "<summary>Report Information"
+      + "<span class='val-notice-count'>" + n + (n === 1 ? " note" : " notes") + "</span>"
+      + "</summary><ul>"
+      + S.warnings.map(function (w) { return "<li>" + esc(w) + "</li>"; }).join("")
+      + "</ul>";
     el.classList.remove("hidden");
   }
 
@@ -727,9 +750,38 @@
         prev = r;
       }
 
+      // Mark idle runs too short to be worth a row at this level. A run is an
+      // "Idling start", any "Idling" rows after it, and the "Idling end" that
+      // closes it. The engine always closes a run, including when the ignition
+      // goes off mid-idle and at the end of the range, so the pairing holds.
+      //
+      // The whole run is dropped or none of it is. Dropping the start and
+      // keeping the end would leave an idle that ends without beginning.
+      //
+      // This only hides rows. day.idleMins was totalled before reduceRows ran,
+      // so the vehicle's idling figure is the same at every detail level.
+      if (rules.minIdleMs > 0) {
+        var runStart = -1;
+        for (i = 0; i < rows.length; i++) {
+          if (rows[i].status === "Idling start") {
+            runStart = i;
+          } else if (rows[i].status === "Idling end" && runStart >= 0) {
+            if (rows[i].ms - rows[runStart].ms < rules.minIdleMs) {
+              for (var j = runStart; j <= i; j++) rows[j].drop = true;
+            }
+            runStart = -1;
+          }
+        }
+      }
+
       var kept = [], lastKept = null;
       for (i = 0; i < rows.length; i++) {
         r = rows[i];
+        // Checked before everything else, including the status-change and
+        // first/last-row exemptions, or a two-second idle at the top of the day
+        // would survive on the strength of being first.
+        if (r.drop) continue;
+
         var isChange = (r.status !== "Moving" && r.status !== "Idling");
         var why = "";
 
@@ -768,6 +820,15 @@
     });
   }
 
+  // "1 minute" reads better than "60 seconds" in the notice, and "3 minutes"
+  // better than "180 seconds". Anything not a whole minute stays in seconds.
+  function describeMs(ms) {
+    var s = Math.round(ms / 1000);
+    if (s % 60 !== 0) return s + " seconds";
+    var m = s / 60;
+    return m + (m === 1 ? " minute" : " minutes");
+  }
+
   // Plain-language version of the active rules, for the notice above the table.
   function describeRules(r) {
     return "A row is written whenever something changes: any status change, " +
@@ -775,7 +836,13 @@
       r.headingDeg + " degrees, or " + Math.round(r.maxGapMs / 60000) +
       " minutes with none of those. Rows are never closer together than " +
       Math.round(r.minGapMs / 1000) + " seconds, except for status changes. " +
-      "Daily distance and idling times are still calculated from every GPS log. " +
+      (r.minIdleMs > 0
+        ? "Idling shorter than " + describeMs(r.minIdleMs) + " is not shown as an " +
+          "idling event, because at that length it is usually a junction or a speed " +
+          "bump rather than a stop. "
+        : "") +
+      "Daily distance and idling times are still calculated from every GPS log, " +
+      "including any idling too short to be listed. " +
       "Hover over a time to see why that row is there, or pick 'Every GPS log' to see them all.";
   }
 
@@ -1062,27 +1129,13 @@
     if (progress) out.insertBefore(block, progress); else out.appendChild(block);
   }
 
-  function renderSummary() {
-    var totalKm = 0, totalIdle = 0, totalRows = 0, dayKeys = {};
-    S.devices.forEach(function (dev) {
-      dev.days.forEach(function (d) {
-        totalKm += d.distKm; totalIdle += d.idleMins; totalRows += d.rows.length; dayKeys[d.dayKey] = 1;
-      });
-    });
-    var cards = [
-      ["Vehicles", S.devices.length, ""],
-      ["Days", Object.keys(dayKeys).length, ""],
-      ["Distance", parseFloat(toDist(totalKm).toFixed(1)), " " + distUnit()],
-      ["Idling", fmtDurWhole(totalIdle), ""],
-      ["Events", totalRows.toLocaleString(), ""]
-    ].map(function (c) {
-      return "<div class='summary-card'><div class='summary-label'>" + c[0] + "</div>"
-        + "<div class='summary-value'>" + c[1] + "<span class='summary-unit'>" + c[2] + "</span></div></div>";
-    });
-    var el = $("val-summary");
-    el.innerHTML = cards.join("");
-    el.classList.remove("hidden");
-  }
+  // There is deliberately no fleet-wide summary here (removed v1.7.0). It totalled
+  // distance, idling and events across every vehicle in the run, which is a fleet
+  // question this report does not answer. The per-vehicle line above each table
+  // ("1 day · 106 events · 30.83 km · 5m idling") carries the same measures scoped
+  // to the vehicle they describe. The summary was also screen-only, so nothing in
+  // it could be cited from the PDF or CSV, and it was not in the report this one
+  // recreates. Fleet aggregates belong in Smart Insights.
 
   // ─── Exports ─────────────────────────────────────────────────────────────
   function flatRows() {
@@ -1251,6 +1304,7 @@
     S.running = true;
     S.devices = [];
     S.warnings = [];
+    $("val-notice").open = false;   // collapsed at the start of every run
     S.addrMap = {};
     // Resolved here, not at load, so the thresholds match whichever unit system
     // the profile read settled on.
@@ -1261,7 +1315,6 @@
     }
     renderLinkInfo();
     renderWarnings();
-    $("val-summary").classList.add("hidden");
     $("val-csv").classList.add("hidden");
     $("val-pdf").classList.add("hidden");
     $("val-run").disabled = true;
@@ -1283,7 +1336,6 @@
       (function next() {
         if (i >= devices.length) {
           if (!S.devices.length) { finish("No activity found for that selection and date range."); return; }
-          renderSummary();
           $("val-csv").classList.remove("hidden");
           $("val-pdf").classList.remove("hidden");
           finish(null);
@@ -1365,7 +1417,6 @@
           S.gState = freshState;
           if (freshState && freshState.database) {
             S.dbName = freshState.database;
-            $("val-db").textContent = freshState.database;
           }
           // getSession is one source for the MyGeotab host and not the best
           // one, so take whatever it gives and let resolveHost fill the gaps.
@@ -1377,7 +1428,6 @@
               }
               if (!S.dbName && session && session.database) {
                 S.dbName = session.database;
-                $("val-db").textContent = session.database;
               }
               if (session && session.userName) S.userName = session.userName;
               resolveHost();

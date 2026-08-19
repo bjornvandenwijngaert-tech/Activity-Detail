@@ -89,6 +89,84 @@ device-scale so the corner is actually inspectable:
 Use this for any future CSS change to these cards. Reasoning about clipping and
 border-radius from the source is what produced the bug in the first place.
 
+### Short idling is hidden, not uncounted (v1.7.1)
+
+**Symptom.** On Balanced detail the table filled with `Idling start` / `Idling end`
+pairs one to five seconds long, several per minute, at addresses walking pace apart
+(10 Glebe Manor, 12 Glebe Manor, 1-9 Glebe Rd). Not stop-and-go at a light: a vehicle
+manoeuvring out of a residential street.
+
+**Cause.** `IDLE_SPEED_KMH = 1` is the only test for idling, with no duration floor,
+and status-change rows bypass `minGapMs`. So every dip below 1 km/h — a junction, a
+speed bump, GPS noise at walking pace — produced two rows that no detail level could
+suppress.
+
+**Fix.** A `minIdleMs` per detail level: 3 minutes on Key events, 1 minute on Balanced,
+0 on Detailed, and no reduction at all on Every GPS log. Applied in `reduceRows`,
+which marks the whole run (`Idling start`, intervening `Idling`, closing `Idling end`)
+with `drop` and skips it before the status-change and first/last-row exemptions. The
+run is dropped whole or not at all; keeping the end without the start would show an
+idle that never began.
+
+**The property that matters: the idling total does not move.** `reduceRows` runs after
+the engine and after `day.idleMins` is totalled, so this rule only chooses rows. The
+same vehicle-day reports the same idling figure at every detail level. Do not push
+this threshold down into the engine. The moment the total depends on which dropdown
+the operator picked, the number is unusable in front of a customer.
+
+Consequence, deliberate: on Balanced the listed idle events no longer sum to the
+vehicle's idling total. Distance already behaves this way and the notice says so
+outright ("still calculated from every GPS log, including any idling too short to be
+listed").
+
+**The values are provisional.** 60s and 180s exclude the observed 1-5s blips and keep
+a normal red-light stop, but they are a judgement, not a measurement. Pending ILLE01:
+run the native Idling report for one vehicle-day and compare. If MyGeotab applies its
+own minimum idle duration, match it. The SDK explorer could not answer this — `Trip`
+is not in the object list and `search idling` returns only `FuelAndEnergyUsed` and
+`FuelUsed` — so the empirical comparison is the only route.
+
+Separately still open: the *total* is inflated by the same phantom idles, since every
+sub-1 km/h dip contributes its seconds. That is a counting question, not a display
+one, and it is what the ILLE01 comparison will size.
+
+### Fleet summary removed, notice collapsed (v1.7.0)
+
+**The five summary cards are gone.** Do not add them back without a reason that
+answers the objection below. They totalled vehicles, days, distance, idling and
+events across every vehicle in the run. Four problems, in order of weight:
+
+1. The per-vehicle line above each table already carries the same measures scoped
+   to the vehicle it describes (`1 day · 106 events · 30.83 km · 5m idling`).
+   The cards restated them summed across unrelated vehicles, so the reader had to
+   work out which figure applied to what they were looking at.
+2. Fleet-wide aggregation is a Smart Insights question. This report answers
+   per-vehicle, per-day, per-event.
+3. Screen only. Neither the PDF nor the CSV contained it, so nothing in it could
+   be cited from the document the customer actually circulates.
+4. It was not in the report this one recreates.
+
+`.summary-card` and `.report-summary` stay in `styles.css`, unchanged and still
+used by legacy-trip-report and smart-insights. Only this report stopped using them.
+
+**The notice panel is now a collapsed `<details>` titled "Report Information".**
+On a normal run its only entry is the row-emission explanation, which is worth
+reading once rather than on every run. Same yellow frame and colours, so it still
+signals "look at this", but closed it is one line. The header carries a note count
+so a run that produced a real warning (missing ignition data, a truncated fetch)
+looks different from a routine one without being opened.
+
+Two details that are load-bearing:
+
+- The default disclosure marker is hidden (`list-style: none` for Firefox,
+  `::-webkit-details-marker` for Chrome and Edge) and replaced with a CSS triangle
+  on `summary::before`. The native marker cannot be positioned consistently across
+  browsers.
+- `open` is reset to `false` exactly once per run, where `S.warnings` is cleared.
+  `renderWarnings` never touches it, because the browser preserves the attribute
+  across an `innerHTML` change and a panel the operator opened mid-run should stay
+  open as later warnings arrive.
+
 ### Summary cards must not reflow (v1.6.3)
 
 The stripe fix above was real but it was not the reported problem. The actual

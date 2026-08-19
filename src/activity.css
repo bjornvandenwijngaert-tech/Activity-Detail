@@ -2,17 +2,57 @@
    styles.css is a straight lift from legacy-trip-report and is kept unmodified so
    fixes can be mirrored between the two. Everything new lives here. */
 
+/* "Report Information" — a <details>, closed by default. Same frame and colours
+   as the old always-open panel, so it still reads as something to look at, but
+   collapsed it is a single line instead of a paragraph the operator has already
+   read. Padding is on the summary and the list rather than the details element,
+   so the closed state is exactly one row tall with no dead space under it. */
 .val-notice {
   background: var(--warning-dim);
   border: 1px solid var(--warning-mid);
   color: #7a5600;
   border-radius: var(--radius-sm);
-  padding: 10px 14px;
   font-size: 13px;
   margin-bottom: 12px;
 }
-.val-notice ul { margin: 6px 0 0; padding-left: 18px; }
-.val-notice li { margin: 2px 0; }
+
+.val-notice > summary {
+  padding: 8px 14px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;          /* Firefox */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+}
+.val-notice > summary::-webkit-details-marker { display: none; }   /* Chrome/Edge */
+
+/* Own disclosure triangle, so it sits where we want it and rotates on open.
+   The default marker cannot be positioned consistently across browsers. */
+.val-notice > summary::before {
+  content: '';
+  width: 0; height: 0; flex: none;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform .15s;
+}
+.val-notice[open] > summary::before { transform: rotate(90deg); }
+
+.val-notice > summary:hover { background: var(--warning-mid); border-radius: var(--radius-sm); }
+.val-notice[open] > summary:hover { border-radius: var(--radius-sm) var(--radius-sm) 0 0; }
+
+/* Count sits right of the title, quieter than it, so a run with an actual
+   warning looks different from a routine one without needing to be opened. */
+.val-notice-count {
+  font-weight: 400;
+  opacity: .75;
+  font-size: 12px;
+}
+
+.val-notice ul { margin: 0; padding: 0 14px 10px 32px; }
+.val-notice li { margin: 3px 0; }
 
 /* Diagnostic strip: says out loud where the Trip History links point, so a wrong
    host or database is visible on screen instead of only in a dead link. */
