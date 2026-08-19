@@ -7,6 +7,64 @@
    collapsed it is a single line instead of a paragraph the operator has already
    read. Padding is on the summary and the list rather than the details element,
    so the closed state is exactly one row tall with no dead space under it. */
+/* Missing vehicles. Red, never collapsible, and above the results, because this
+   is the one message that changes whether the report is safe to send. It is
+   deliberately louder than .val-notice: a vehicle absent from the report is not
+   the same class of thing as a note about row thresholds. */
+.val-failed {
+  background: var(--critical-dim);
+  border: 1px solid var(--critical-mid);
+  border-left: 4px solid var(--critical);
+  color: #8a1c1c;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+.val-failed ul { margin: 6px 0; padding-left: 22px; }
+.val-failed li { margin: 2px 0; font-weight: 600; }
+.val-failed p  { margin: 6px 0 0; font-weight: 400; }
+
+/* Same block, amber, for the case where calls failed but the retries saved them.
+   Worth reporting, not worth alarming anyone: nothing is missing. */
+.val-failed-soft {
+  background: var(--warning-dim);
+  border-color: var(--warning-mid);
+  border-left-color: var(--warning);
+  color: #7a5600;
+}
+
+.val-failed-actions { display: flex; gap: 8px; margin-top: 10px; }
+.val-failed-actions button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+  color: inherit;
+  background: rgba(255, 255, 255, .65);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  opacity: .85;
+}
+.val-failed-actions button:hover { opacity: 1; }
+
+/* Monospace and scrollable: this is meant to be selected and pasted into a
+   ticket, so it must not reflow or truncate. */
+.val-diag {
+  margin: 10px 0 0;
+  padding: 10px;
+  max-height: 320px;
+  overflow: auto;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(255, 255, 255, .7);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+}
+
 .val-notice {
   background: var(--warning-dim);
   border: 1px solid var(--warning-mid);

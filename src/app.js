@@ -24,7 +24,13 @@
   // the API returns: LogRecord.speed is km/h regardless of who is logged in.
   // Imperial is a display conversion applied at the last moment, in fmtDist and
   // fmtSpeed. Do not convert earlier or thresholds start disagreeing with data.
+  // Stamped into the copied diagnostics, so a pasted failure report says which
+  // build produced it. Keep in step with index.html and config.json.
+  var APP_VERSION     = "1.7.4";
+
   var IDLE_SPEED_KMH  = 1;
+  var IDLE_RESUME_KM  = 0.05;   // 50 m of ground covered ends a stop
+  var IDLE_RESUME_MS  = 30000;  // or 30 s above the speed threshold, whichever first
   var KM_PER_MILE     = 1.609344;
   var MAX_RECORDS     = 50000;  // hard cap on a single Get
   var SPLIT_DEPTH     = 6;      // how many times to halve a window that hits the cap
@@ -60,18 +66,23 @@
   //               level. Status changes bypass minGapMs, which is why a car
   //               creeping through 1 km/h for two seconds still produced an
   //               Idling start and an Idling end on Balanced. Below this
-  //               length we do not believe it was a stop: it is a junction, a
-  //               speed bump, or GPS noise at walking pace. The time is still
-  //               counted in the day total, so the headline idling figure is
-  //               the same whichever level is picked. Only the rows differ.
+  //               length we do not believe it was a stop worth reporting. The
+  //               time is still counted in the day total, so the headline
+  //               idling figure is the same whichever level is picked. Only
+  //               the rows differ.
+  //               45 s on Balanced is a typical wait at a red light: a signal
+  //               cycle runs 60-120 s and your approach holds red for a third
+  //               to a half of it. 120 s on Key events is the bad wait at a
+  //               large junction, so only stops longer than any red light
+  //               reach that view.
   //
   // Each level carries a metric and an imperial pair rather than one pair that
   // gets converted. Converting 1.5 km would put "0.9 mi" in front of an imperial
   // user, which reads like a rounding artefact. These are round numbers in both
   // systems and close enough to each other that the output density matches.
   var DETAIL_LEVELS = {
-    key:      { metric: { dist: 5,   speed: 30 }, imperial: { dist: 3,   speed: 20 }, headingDeg: 90, maxGapMs: 900000, minGapMs: 60000, minIdleMs: 180000 },
-    balanced: { metric: { dist: 1.5, speed: 20 }, imperial: { dist: 1,   speed: 12 }, headingDeg: 45, maxGapMs: 300000, minGapMs: 30000, minIdleMs: 60000  },
+    key:      { metric: { dist: 5,   speed: 30 }, imperial: { dist: 3,   speed: 20 }, headingDeg: 90, maxGapMs: 900000, minGapMs: 60000, minIdleMs: 120000 },
+    balanced: { metric: { dist: 1.5, speed: 20 }, imperial: { dist: 1,   speed: 12 }, headingDeg: 45, maxGapMs: 300000, minGapMs: 30000, minIdleMs: 45000  },
     detailed: { metric: { dist: 0.5, speed: 10 }, imperial: { dist: 0.3, speed: 6  }, headingDeg: 30, maxGapMs: 120000, minGapMs: 15000, minIdleMs: 0      },
     all:      null
   };
@@ -104,6 +115,8 @@
     addrMap:    {},     // "lat,lng" -> resolved address
     devices:    [],     // [{ id, name, days: [{ dayKey, rows, distKm, idleMins }] }]
     warnings:   [],
+    failed:     [],     // vehicle names left out of the report; see addFailure
+    apiLog:     [],     // every failed attempt this run; see recordApiFailure
     running:    false,
     rules:      null,   // active DETAIL_LEVELS entry; null shows every GPS log
     tzId:       "",     // MyGeotab User.timeZoneId; "" falls back to the browser
@@ -117,10 +130,153 @@
   // ─── Generic helpers ─────────────────────────────────────────────────────
   function $(id) { return document.getElementById(id); }
 
-  function apiCall(method, params, onSuccess, onError) {
-    S.api.call(method, params, onSuccess, onError || function (err) {
-      console.error("[VehicleActivityLog]", method, err);
+  // Retry before giving up. A dropped request used to cost a whole vehicle:
+  // 171 WX 2519 SPARE drove 430 km across Ireland on 18 Aug 2026 and the report
+  // showed nothing for it, because one Get failed and nothing tried again.
+  //
+  // Most failures here are transient: a timed-out request, a 502 from the load
+  // balancer, or MyGeotab's rate limiter. All three succeed on a second attempt
+  // moments later. Backoff is 1 s, 3 s, then 9 s, so a vehicle is only declared
+  // unreadable after 13 seconds of the server refusing.
+  //
+  // What is NOT retried is a request the server understood and rejected: a bad
+  // parameter, a missing entity, or an expired session. Repeating those just
+  // makes the operator wait longer for the same answer. OverLimit is the one
+  // 4xx worth repeating, because it means "later", not "no".
+  var RETRY_DELAYS_MS = [1000, 3000, 9000];
+
+  // The failure that cost us 171 WX 2519 SPARE on 18 Aug 2026 left nothing behind
+  // to look at: the error went to console.error in a session nobody had DevTools
+  // open on, and by the time it was reported the evidence was gone. Three days of
+  // work went into proving where it did NOT happen.
+  //
+  // So every failed attempt is now recorded, retried or not, and can be copied
+  // out of the red block as text. The next occurrence is diagnosable from a
+  // screenshot-and-paste instead of a reproduction attempt.
+  var MAX_API_LOG = 200;
+
+  // An Error does not survive JSON.stringify: own properties on Error instances
+  // are non-enumerable, so it serialises to "{}". Walk it by hand instead, and
+  // take whatever a non-Error object carries, because the shape the add-in `api`
+  // object hands the failure callback is not documented and may not be an Error
+  // at all. Recording everything is the point.
+  function describeError(err) {
+    if (err == null) return { note: "error callback fired with " + String(err) };
+    if (typeof err !== "object") return { value: String(err), jsType: typeof err };
+    var out = { jsType: Object.prototype.toString.call(err) };
+    ["name", "message", "type", "code", "stack", "id", "requestIndex"].forEach(function (k) {
+      if (err[k] != null) out[k] = String(err[k]).slice(0, 800);
     });
+    // Geotab nests the useful part: error.data.type / error.data.info.
+    if (err.data && typeof err.data === "object") {
+      out.data = {};
+      ["type", "id", "requestIndex"].forEach(function (k) {
+        if (err.data[k] != null) out.data[k] = String(err.data[k]);
+      });
+      if (err.data.info != null) {
+        try { out.data.info = JSON.stringify(err.data.info).slice(0, 800); }
+        catch (e) { out.data.info = String(err.data.info).slice(0, 800); }
+      }
+    }
+    // Anything enumerable we did not name above.
+    try {
+      Object.keys(err).forEach(function (k) {
+        if (out[k] === undefined && k !== "data") {
+          out[k] = String(err[k]).slice(0, 400);
+        }
+      });
+    } catch (e) { /* exotic proxy; the named fields above are enough */ }
+    return out;
+  }
+
+  function recordApiFailure(method, params, attempt, willRetry, err) {
+    if (S.apiLog.length >= MAX_API_LOG) return;
+    var p = params || {};
+    S.apiLog.push({
+      at:       new Date().toISOString(),
+      method:   method,
+      typeName: p.typeName || "",
+      // The device and window are what make a failure reproducible later.
+      device:   (p.search && p.search.deviceSearch && p.search.deviceSearch.id) ||
+                (p.search && p.search.id) || "",
+      from:     (p.search && p.search.fromDate) || "",
+      to:       (p.search && p.search.toDate) || "",
+      attempt:  attempt,
+      retried:  willRetry,
+      error:    describeError(err)
+    });
+  }
+
+  // Plain text, because it has to survive being pasted into an email or a ticket.
+  function apiLogText() {
+    return "Vehicle Activity Log " + APP_VERSION + " API failures\n" +
+      "database: " + (S.dbName || "?") + "  server: " + (S.server || "?") + "\n" +
+      "user: " + (S.userName || "?") + "  browser tz: " +
+      (Intl.DateTimeFormat().resolvedOptions().timeZone || "?") + "\n" +
+      "generated: " + new Date().toISOString() + "\n\n" +
+      S.apiLog.map(function (e, i) {
+        return (i + 1) + ". " + e.at + "  " + e.method +
+          (e.typeName ? " " + e.typeName : "") +
+          "\n   device=" + (e.device || "-") +
+          "  window=" + (e.from || "-") + " .. " + (e.to || "-") +
+          "\n   attempt " + e.attempt + (e.retried ? " (retried)" : " (gave up)") +
+          "\n   " + JSON.stringify(e.error);
+      }).join("\n\n");
+  }
+
+  // The only thing NOT retried is a request the server understood and rejected on
+  // its shape: a bad parameter, an unknown type, a malformed search. Those fail
+  // identically forever, so repeating one only makes the operator wait longer for
+  // the same answer.
+  //
+  // Everything else is retried, and the session and database errors are retried
+  // deliberately. Geotab's guidance is that DbUnavailableException means the
+  // database has moved servers in the federation, and that the API object makes a
+  // single re-authentication attempt when that or InvalidUserException comes back.
+  // Retrying is what gives it the chance to do that and land on the new server.
+  // Treating either as fatal, which this function first did, would throw away a
+  // vehicle over a failover the SDK was about to recover from by itself.
+  //
+  // So the default is retry. An unrecognised error costs 13 seconds if it was
+  // hopeless and saves a vehicle if it was not. That trade is not close.
+  function isRetryable(err) {
+    var text = [
+      (err && (err.name || err.type)) || "",
+      (err && err.message) || "",
+      (err && err.data && err.data.type) || "",
+      typeof err === "string" ? err : ""
+    ].join(" ");
+    return !/ArgumentException|InvalidArgument|Missing[ _]?[Pp]arameter|MissingMethod|UnknownMethod|NotSupported|InvalidCast/i.test(text);
+  }
+
+  function apiCall(method, params, onSuccess, onError) {
+    var attempt = 0;
+
+    function fail(err) {
+      if (onError) { onError(err); return; }
+      console.error("[VehicleActivityLog]", method, err);
+    }
+
+    function go() {
+      S.api.call(method, params, onSuccess, function (err) {
+        var willRetry = attempt < RETRY_DELAYS_MS.length && isRetryable(err);
+        // Recorded whether or not we retry. A call that failed twice and then
+        // succeeded still says something about what is going wrong, and that is
+        // exactly the evidence the 18 Aug failure did not leave behind.
+        recordApiFailure(method, params, attempt + 1, willRetry, err);
+        if (willRetry) {
+          var wait = RETRY_DELAYS_MS[attempt];
+          attempt++;
+          console.warn("[VehicleActivityLog] " + method + " failed, retry " +
+                       attempt + " of " + RETRY_DELAYS_MS.length + " in " + wait + "ms", err);
+          setTimeout(go, wait);
+          return;
+        }
+        fail(err);
+      });
+    }
+
+    go();
   }
 
   // Single quotes MUST be escaped here. Every attribute in this file is written
@@ -335,6 +491,75 @@
     renderWarnings();
   }
 
+  // A vehicle that could not be read is not a note. It is a hole in the report,
+  // and the operator has to know before sending it to a customer. So it gets its
+  // own block, always open, above the results, listing every affected vehicle by
+  // name. Notes stay in the collapsed panel where they belong.
+  function addFailure(name) {
+    if (S.failed.indexOf(name) === -1) S.failed.push(name);
+    renderFailures();
+  }
+
+  function renderFailures() {
+    var el = $("val-failed");
+    if (!el) return;
+
+    // The block also appears when nothing was lost but calls failed and
+    // recovered, because a run that needed three attempts is worth knowing
+    // about before it becomes a run that needed five.
+    if (!S.failed.length && !S.apiLog.length) {
+      el.classList.add("hidden"); el.innerHTML = ""; return;
+    }
+
+    var html = "";
+    if (S.failed.length) {
+      var n = S.failed.length;
+      el.classList.remove("val-failed-soft");
+      html += "<strong>" + (n === 1 ? "1 vehicle is missing from this report."
+                                    : n + " vehicles are missing from this report.") +
+        "</strong><ul>" +
+        S.failed.map(function (v) { return "<li>" + esc(v) + "</li>"; }).join("") +
+        "</ul><p>MyGeotab did not return their data after four attempts. This is not a " +
+        "sign that they were parked. Run the report again, or run those vehicles on " +
+        "their own, before sending it to anyone.</p>";
+    } else {
+      el.classList.add("val-failed-soft");
+      html += "<strong>" + S.apiLog.length + " request" +
+        (S.apiLog.length === 1 ? "" : "s") + " to MyGeotab failed and were retried " +
+        "successfully.</strong><p>Nothing is missing from this report. Recorded so " +
+        "the failures can be looked at if they become frequent.</p>";
+    }
+
+    html += "<p class='val-failed-actions'>" +
+      "<button type='button' id='val-diag-copy'>Copy technical detail</button>" +
+      "<button type='button' id='val-diag-show'>Show technical detail</button>" +
+      "</p><pre id='val-diag' class='val-diag hidden'></pre>";
+
+    el.innerHTML = html;
+    el.classList.remove("hidden");
+
+    $("val-diag-show").addEventListener("click", function () {
+      var pre = $("val-diag");
+      var open = !pre.classList.contains("hidden");
+      pre.classList.toggle("hidden", open);
+      if (!open) pre.textContent = apiLogText();
+      this.textContent = open ? "Show technical detail" : "Hide technical detail";
+    });
+
+    $("val-diag-copy").addEventListener("click", function () {
+      var btn = this, text = apiLogText();
+      function done(ok) { btn.textContent = ok ? "Copied" : "Copy failed, use Show instead"; }
+      // clipboard.writeText needs a secure context and can be blocked inside the
+      // MyGeotab page, so fall back rather than silently doing nothing.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { done(true); },
+                                                 function () { done(false); });
+      } else {
+        done(false);
+      }
+    });
+  }
+
   // A <details> rather than an always-open panel: on most runs the only entry is
   // the row-emission explanation, which is worth reading once and not on every
   // run. Collapsed it is one line; the yellow frame still marks it as something
@@ -436,6 +661,16 @@
 
   // Halve the window whenever a Get hits the 50 000 record cap, so a busy
   // vehicle over a long range still comes back complete.
+  //
+  // cb(null) means the fetch FAILED. cb([]) means it succeeded and the vehicle
+  // has no logs. Up to v1.7.2 both were [], which is how a vehicle that drove
+  // 430 km rendered as a confident "0 km, 1 event": the Get failed, the empty
+  // array flowed through the engine, and the only row left was an ignition
+  // change borrowing its position from a boundary record. Verified against
+  // ILLE01 device bA on 18 Aug 2026 — the API had 3,957 log records and the
+  // engine reproduces 429.71 km from them, so nothing was wrong except that a
+  // failed call looked exactly like an idle vehicle. A wrong number stated
+  // confidently is worse than an error, so failure must never be silent here.
   function fetchLogRecords(deviceId, fromIso, toIso, depth, cb) {
     apiCall("Get", {
       typeName: "LogRecord",
@@ -446,14 +681,20 @@
         if (depth < SPLIT_DEPTH) {
           var mid = new Date((new Date(fromIso).getTime() + new Date(toIso).getTime()) / 2).toISOString();
           fetchLogRecords(deviceId, fromIso, mid, depth + 1, function (a) {
-            fetchLogRecords(deviceId, mid, toIso, depth + 1, function (b) { cb(a.concat(b)); });
+            if (a === null) { cb(null); return; }   // half the window is missing
+            fetchLogRecords(deviceId, mid, toIso, depth + 1, function (b) {
+              cb(b === null ? null : a.concat(b));
+            });
           });
           return;
         }
         addWarning("A vehicle returned the maximum of 50,000 GPS records even after splitting the range. Some rows are missing. Shorten the date range.");
       }
       cb(recs);
-    }, function () { cb([]); });
+    }, function (err) {
+      console.error("[VehicleActivityLog] LogRecord fetch failed", deviceId, fromIso, toIso, err);
+      cb(null);
+    });
   }
 
   // Ignition StatusData is only written on state change, so the state at the
@@ -623,6 +864,52 @@
       cumKm = 0;
       prevPt = null;
       inIdle = false;
+      pend = null;   // same pre-existing gap as inIdle: an idle open across
+                     // local midnight is abandoned rather than split
+    }
+
+    // A stop is not over the first time GPS reports 1 km/h. A vehicle standing
+    // at a light reads 0.4, 1.3, 0.6, 1.1 as the fix wanders, and the old code
+    // read that as four separate stops with three departures in between. That is
+    // what produced a day of one-to-five-second idles that summed to two minutes
+    // but contained no single idle worth a row.
+    //
+    // So when speed rises we hold the idle open and buffer the rows instead of
+    // emitting them. The stop is only over once the vehicle has covered
+    // IDLE_RESUME_KM of ground or stayed above the threshold for IDLE_RESUME_MS.
+    // Distance is the test that does the work: a real departure clears 50 m in
+    // seconds, while a fix wandering at a standstill never does. The time test
+    // is the backstop for genuine creeping.
+    //
+    // pend is null when no idle is being held open, otherwise
+    // { ms, km, buf } captured at the moment speed first rose.
+    var pend = null;
+
+    function openPending(p) {
+      pend = { ms: p.ms, km: cumKm, buf: [p] };
+    }
+
+    // The vehicle really did leave. The first buffered point becomes the
+    // Idling end, the rest become Moving, which is what the old code produced
+    // for a departure with no jitter.
+    function confirmPending() {
+      var b = pend.buf, first = b[0];
+      var mins = (first.ms - idleStartMs) / 60000;
+      day.idleMins += mins;
+      inIdle = false;
+      pushAt(first.t, "Idling end", "idle", first,
+             "Idling time: [" + fmtDurPrecise(mins) + "]", true);
+      for (var k = 1; k < b.length; k++) pushAt(b[k].t, "Moving", "moving", b[k], "", true);
+      pend = null;
+    }
+
+    // It was noise. The buffered points belong to the stop, so they are Idling
+    // rows and idleStartMs is left alone: the stop is one continuous run.
+    function cancelPending() {
+      for (var k = 0; k < pend.buf.length; k++) {
+        pushAt(pend.buf[k].t, "Idling", "idle", pend.buf[k], "", false);
+      }
+      pend = null;
     }
 
     // iso is the event's own time; pt supplies only the position.
@@ -647,6 +934,9 @@
         if (tr.on === curIgn) continue;
         var at = nearestPt(tr.ms);
         if (!at) continue;                       // no position to put it on
+        // The engine stopping settles any idle we were holding open: whatever
+        // the vehicle was doing, it is over now.
+        if (pend) confirmPending();
         if (localDayKey(tr.t) !== curDayKey) startDay(localDayKey(tr.t));
         curIgn = tr.on;
         if (curIgn) {
@@ -678,6 +968,7 @@
       if (!curIgn) continue;      // no rows while the ignition is off
 
       if (p.speed < IDLE_SPEED_KMH) {
+        if (pend) { cancelPending(); continue; }   // the excursion was jitter
         if (!inIdle) {
           inIdle = true;
           idleStartMs = p.ms;
@@ -686,16 +977,24 @@
           pushAt(p.t, "Idling", "idle", p, "", false);
         }
       } else {
-        if (inIdle) {
-          var mins = (p.ms - idleStartMs) / 60000;
-          day.idleMins += mins;
-          inIdle = false;
-          pushAt(p.t, "Idling end", "idle", p, "Idling time: [" + fmtDurPrecise(mins) + "]", true);
-        } else {
-          pushAt(p.t, "Moving", "moving", p, "", true);
+        if (inIdle && !pend) {
+          // Do not close the idle here. Hold it open until we know whether the
+          // vehicle actually left. See openPending.
+          openPending(p);
+          continue;
         }
+        if (pend) {
+          pend.buf.push(p);
+          if (p.ms - pend.ms >= IDLE_RESUME_MS || cumKm - pend.km >= IDLE_RESUME_KM) {
+            confirmPending();
+          }
+          continue;
+        }
+        pushAt(p.t, "Moving", "moving", p, "", true);
       }
     }
+
+    if (pend) confirmPending();   // ran out of logs while holding an idle open
 
     if (day) day.distKm = cumKm;
 
@@ -1304,6 +1603,9 @@
     S.running = true;
     S.devices = [];
     S.warnings = [];
+    S.failed = [];
+    S.apiLog = [];
+    renderFailures();               // clears last run's missing-vehicle block
     $("val-notice").open = false;   // collapsed at the start of every run
     S.addrMap = {};
     // Resolved here, not at load, so the thresholds match whichever unit system
@@ -1345,7 +1647,28 @@
         setProgress("Loading " + dev.name + " (" + i + " of " + devices.length + ")...");
 
         fetchLogRecords(dev.id, fromIso, toIso, 0, function (logs) {
+          // A failed fetch is never rendered. Showing the vehicle with the rows
+          // we happen to have would put "0 km" next to its name, which reads as
+          // a fact about the vehicle rather than about the request.
+          if (logs === null) {
+            addFailure(dev.name);
+            next();
+            return;
+          }
+
+          // The Get succeeded but returned nothing but boundary records, which
+          // MyGeotab manufactures at each end of the window. Real logs all carry
+          // an id. Distance and every row come from real logs, so without them
+          // the vehicle would report zeroes it cannot back up.
+          var realLogs = 0;
+          for (var li = 0; li < logs.length; li++) if (logs[li].id) realLogs++;
+
           fetchIgnition(dev.id, fromIso, toIso, function (ign) {
+            if (!realLogs && ign && ign.length > 1) {
+              addWarning("No GPS records for " + dev.name + " in this range, but it does have " +
+                "ignition activity. Distance and idling for that vehicle are shown as zero because " +
+                "there is nothing to measure them from, not because it stood still.");
+            }
             if (ign === null) {
               addWarning("Ignition data could not be read for " + dev.name + ". Idling for that vehicle is estimated from GPS speed alone and will not match the native Idling report.");
             } else if (!ign.length) {
@@ -1384,6 +1707,9 @@
 
     function finish(message) {
       S.running = false;
+      // Rendered once at the end rather than on each failure: a mid-run redraw
+      // would wipe the technical-detail panel out from under anyone reading it.
+      renderFailures();
       $("val-run").disabled = false;
       var p = $("val-progress");
       if (p) {

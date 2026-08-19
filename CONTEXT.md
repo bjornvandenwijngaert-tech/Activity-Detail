@@ -89,6 +89,188 @@ device-scale so the corner is actually inspectable:
 Use this for any future CSS change to these cards. Reasoning about clipping and
 border-radius from the source is what produced the bug in the first place.
 
+### A failed fetch rendered as "0 km" (v1.7.3, actually fixed in v1.7.4)
+
+**Symptom.** 171 WX 2519 SPARE, 18 Aug 2026: the report showed one row (an
+`Ignition off` at 18:36:07 BST), `0 km`, `1 event`, `0m idling`. Trips History for the
+same device and day showed 430 km, 6h20 driving, 16 stops, 43 exceptions.
+
+**What was checked, against live ILLE01 (device id `bA`).** All of this is measured,
+not inferred:
+
+- `LogRecord` for the local day returns **3,957 records**, 2 of them boundary records,
+  none missing coordinates. The data exists.
+- `StatusData` on `DiagnosticIgnitionId` returns **31 records**: an opening boundary
+  at `data=0` and 30 real transitions, first on at 06:38:22Z, last off at 17:36:07Z.
+  That last record is exactly the single row the report displayed.
+- Running the **real `buildActivity`** over those two pulls produces
+  **429.71 km** against Trips History's 430 km, 15 ignition cycles, and 480 rows on
+  Balanced. The engine is correct.
+- A sweep of seven candidate search windows (local day, UTC day, next day, and four
+  truncated windows) produces either the full 480 rows or zero rows. **No window
+  reproduces the observed one-row output.** `tzInstant` builds the window correctly
+  for Europe/Dublin.
+
+**Cause.** `fetchLogRecords` had `function () { cb([]); }` as its error handler. An
+API failure returned the same empty array as a genuinely idle vehicle, with no
+warning. The empty array flowed through the engine, the ignition transition borrowed
+its position from a boundary record, and the vehicle rendered as a confident `0 km`.
+
+The exact trigger for the failed call is **not** established — it was transient and
+did not reproduce. What is established is the code path that turns any such failure
+into a plausible-looking wrong number.
+
+**Fix, part one (v1.7.3): stop lying.** `cb(null)` means the fetch failed, `cb([])`
+means it succeeded and found nothing. The two are now distinct, the split path
+propagates `null` rather than concatenating half a window, and `runReport` skips a
+failed vehicle instead of rendering it. A second guard covers a vehicle that returns
+ignition activity but no real GPS logs, which also produces defensible-looking zeroes
+from nothing.
+
+**This part is not a fix and must not be recorded as one.** It converts a wrong number
+into a missing vehicle. Better, but a van that crossed Ireland is still absent from a
+report you would hand to a customer. That was the gap in the v1.7.3 write-up and Bjorn
+caught it: *"that doesn't fix anything."*
+
+**Fix, part two (v1.7.4): don't accept the first failure.** `apiCall` now retries with
+1 s, 3 s and 9 s backoff, so every request in the add-in gets four attempts across 13
+seconds before anything is declared unreadable. This is where the actual repair lives.
+The failures that cost the vehicle here (a timeout, a 502, the rate limiter) all
+succeed on a second attempt moments later.
+
+Deliberately **not** retried: anything the server understood and rejected. A bad
+parameter, an expired session or a malformed request fails identically forever, so
+repeating it only makes the operator wait longer for the same answer. `OverLimit` is
+the exception among 4xx, because it means "later", not "no". See `isRetryable`.
+
+**Fix, part three (v1.7.4): make the hole impossible to miss.** A vehicle that fails
+all four attempts is no longer a note in the collapsed panel. `addFailure` puts it in
+`#val-failed`: red, always open, above the results, naming every affected vehicle, and
+saying in as many words that this is not a sign they were parked. Notes and holes are
+different classes of thing and must not share a container.
+
+**Rule this establishes: never let a fetch failure reach the renderer as data, and
+never let one failed attempt end a fetch.** Silence is the worst outcome, an absence is
+the second worst, and only the retry actually avoids both. A vehicle reporting 0 km
+when it drove 430 is unrecoverable because nobody has a reason to question it.
+
+**Investigating the failed call (what was tried, what is left).**
+
+Ruled out by measurement, on 19 Aug 2026 against live ILLE01:
+
+- **The query is not fragile.** The exact failing Get, 30 times in series: 30 clean,
+  averaging 639 ms, slowest 1.7 s. No failures.
+- **It is not rate limiting at this scale.** The same Get, 12 at once: 12 clean, slowest
+  943 ms. A single-vehicle day is nowhere near the limit.
+
+Neither test can reach the real suspect, and that is the useful conclusion. The CLI
+speaks to `my.geotab.com` over its own HTTP client. The add-in goes through the `api`
+object MyGeotab injects into the page, carrying the page's session. Anything living in
+that layer — a session expiring mid-run, a federation failover, the browser dropping a
+request, an extension or proxy interfering — is invisible from outside the browser.
+More CLI probing will not find it.
+
+So the remaining hypotheses, and what now distinguishes them, all from the copied
+diagnostics:
+
+| Hypothesis | What the log will show |
+|---|---|
+| Session expired mid-run | `InvalidUserException` / "Invalid session"; now retried, so the SDK re-auths |
+| Database moved in the federation | `DbUnavailableException`; now retried |
+| Rate limiter on a large group run | `OverLimitException`; now retried, and the timestamps show the burst |
+| Browser dropped the request | An `Error` with a network message and no Geotab type |
+| Something else entirely | Whatever `describeError` captured, which is the point |
+
+**The instrumentation is the investigation.** `recordApiFailure` logs every failed
+attempt, retried or not, with method, typeName, device id, the search window, the
+attempt number and a full unpacking of the error. `describeError` exists because
+`JSON.stringify(new Error("boom"))` is `"{}"` — Error properties are non-enumerable, so
+the naive approach records nothing. It also handles a non-Error, since the shape the
+injected `api` object passes its failure callback is not documented.
+
+The operator copies it out of the red block as plain text. A pasted log beats a
+reproduction attempt for something this rare.
+
+**Note on `isRetryable`, because the first version had it backwards.** Session and
+federation errors are retried on purpose. Geotab's guidance is that
+`DbUnavailableException` means the database moved servers in the federation and that
+the API object makes a single re-authentication attempt when it or
+`InvalidUserException` comes back. Retrying is what gives it the chance. Only
+request-shape errors (`ArgumentException`, `MissingMethod`, a bad parameter) are fatal,
+because those fail identically forever. Default is retry.
+
+**Tests.** `.diag/retry-test.js` runs the real `apiCall` against a fake `api.call` that
+fails a set number of times: 37 assertions covering the retry count, the ~13 s total
+backoff, what is and is not retried, error unpacking, and the copied text. It caught
+the `DbUnavailableException` mistake above. Run it after touching `apiCall`,
+`isRetryable` or `describeError`. `.diag/load-app.js` holds the shared vm loader.
+
+**Harness.** `.diag/engine-harness.js` runs the real `buildActivity` from `src/app.js`
+against JSON pulled from a live database, with no browser and no MyGeotab session. It
+loads app.js as text, injects an export just before the IIFE closes, and evaluates it
+against a stub window/document — app.js is not modified on disk. `.diag/window-sweep.js`
+builds on it to test candidate search windows, emulating the boundary records MyGeotab
+manufactures at each end. Pull inputs with:
+
+```
+cli-mygeotab log record --device-id bA --from 2026-08-17T23:00:00Z --to 2026-08-18T23:00:00Z --limit 60000 -o json --quiet
+cli-mygeotab log status --device-id bA --diagnostic-id DiagnosticIgnitionId --from ... --to ... -o json --quiet
+node .diag/engine-harness.js logs.json ign.json <fromIso> <toIso>
+```
+
+Use this before theorising about engine behaviour again. Reasoning from the source is
+what produced three wrong hypotheses here before the harness settled it in one run.
+
+**Note on the CLI's `speedKph` field: it is wrong.** `log record` emits both `speed`
+and `speedKph`, and `speedKph` is `speed * 3.6`, which turns a 90 km/h motorway run
+into 324. `LogRecord.speed` is already km/h. Use `speed`, ignore `speedKph`.
+
+**Open, and now measurable: idling is roughly double.** The engine reports 56.2 min
+for this device-day; Trips History reports 00:26:34. Same data, same day. This is the
+over-count the sub-1 km/h threshold was always suspected of causing, and it is now
+reproducible offline through the harness rather than needing a live run. Size and fix
+it before showing idling to a customer.
+
+### Idle runs are coalesced across GPS jitter (v1.7.2)
+
+**Symptom after v1.7.1.** 45 rows shown of 448, zero idling rows, and a 2-minute
+idling total. Every individual idle on that day was under 45 seconds, so the whole
+total was made of fragments.
+
+**Cause, and it was the real one.** A stop was ending the first time GPS reported
+1 km/h. A stationary vehicle reads 0.4, 1.3, 0.6, 1.1 as the fix wanders, so one
+90-second wait at a light was recorded as four stops with three departures between
+them. No duration threshold can rescue that: the fragments are short because the
+stop was chopped up, not because the vehicle was moving.
+
+**Fix.** When speed rises the idle is held open and its rows are buffered rather
+than emitted. The stop ends only once the vehicle covers `IDLE_RESUME_KM` (50 m) or
+stays above the threshold for `IDLE_RESUME_MS` (30 s). Distance does the work: a
+real departure clears 50 m in seconds, a wandering fix at a standstill never does.
+Time is the backstop for genuine creeping.
+
+Three states, in `buildDays`: `openPending` (speed rose, decision deferred),
+`confirmPending` (vehicle left — first buffered point becomes `Idling end`, the rest
+become `Moving`, exactly what the old code emitted for a clean departure), and
+`cancelPending` (it was noise — buffered points become `Idling` rows and
+`idleStartMs` is untouched, so the stop stays one run). Pending is also confirmed on
+ignition off and at the end of the log stream, and reset in `startDay` alongside
+`inIdle`.
+
+**This changes the idling total, deliberately and upward.** The old total summed the
+fragments and lost the gaps between them. The new one counts a coalesced stop end to
+end, which is what actually happened. Expect the day figure to rise slightly. It is
+still detail-level independent.
+
+**Thresholds revised** now that runs are whole: Balanced 45 s (a typical red-light
+wait, since a signal cycle is 60-120 s and one approach holds red for a third to a
+half of it), Key events 120 s (the bad wait at a large junction, so only stops longer
+than any red light reach that view). Detailed and Every GPS log unchanged.
+
+If a day still shows no idling rows after this, that is now a finding rather than an
+artefact: switch to Every GPS log and read what the total is actually made of before
+touching the thresholds again.
+
 ### Short idling is hidden, not uncounted (v1.7.1)
 
 **Symptom.** On Balanced detail the table filled with `Idling start` / `Idling end`
