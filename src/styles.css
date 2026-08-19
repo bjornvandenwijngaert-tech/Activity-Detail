@@ -600,9 +600,17 @@ body {
 }
 
 /* ─── Report summary cards ──────────────────────────────────────────────────── */
+/* One row of equal columns at every zoom level. The old rule was
+   repeat(auto-fill, minmax(150px, 1fr)), which recounts how many 150px tracks
+   fit each time the container's CSS-pixel width changes. Zooming in shrinks
+   that width, so the columns first stretched, then wrapped to a second row.
+   That is why the cards drifted apart and eventually staggered instead of just
+   getting bigger. grid-auto-flow: column pins the column count to the number of
+   cards rendered, so zoom scales the whole block and never re-lays it out. */
 .report-summary {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   gap: 12px;
   margin-bottom: 18px;
 }

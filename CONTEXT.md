@@ -89,6 +89,37 @@ device-scale so the corner is actually inspectable:
 Use this for any future CSS change to these cards. Reasoning about clipping and
 border-radius from the source is what produced the bug in the first place.
 
+### Summary cards must not reflow (v1.6.3)
+
+The stripe fix above was real but it was not the reported problem. The actual
+complaint was cards appearing to run into each other, with the right-hand edge
+missing on every card except the last.
+
+The container was `repeat(auto-fill, minmax(150px, 1fr))`. `auto-fill` recounts
+how many 150px tracks fit whenever the container's CSS-pixel width changes.
+Browser zoom changes exactly that, so zooming in stretched the columns and then
+wrapped them to a second row. Confirmed by the symptom: gaps widened with zoom
+and the cards eventually staggered vertically.
+
+Now `grid-auto-flow: column` with `grid-auto-columns: 1fr`. That pins the column
+count to the number of cards rendered, so the block is a fixed frame and zoom
+scales it rather than re-laying it out. Chosen over `repeat(5, 1fr)` because the
+same rule is shared by three reports that do not all render five cards. Verified
+by rendering at 100%, 175% and 250%: one row throughout, no wrap.
+
+Trade-off accepted deliberately: the cards no longer wrap on a narrow container,
+so at small widths they compress instead of stacking. That is what was asked for.
+
+**Still open.** The missing right-hand border did not reproduce in headless
+Chrome at 100/125/150% scaling or at any of the zoom levels above. The working
+theory is device-pixel snapping: a 1px border on a fractional track boundary can
+round to zero device pixels, which fits the border reappearing at 175% zoom where
+it covers nearly two. Equal fixed columns land on cleaner boundaries than
+auto-fill tracks did, so this change may resolve it as a side effect. If it does
+not, the fix is to draw the frame as `box-shadow: 0 0 0 1px var(--border)`, which
+antialiases instead of snapping. Do not try that until the grid change has been
+checked on the affected machine.
+
 ## Namespacing (important)
 
 MyGeotab add-in pages are injected into the host page, not iframed, so every
