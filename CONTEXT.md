@@ -84,7 +84,8 @@ Per device:
    reset at local midnight. Segments where both endpoints are below 1 km/h are
    skipped so GPS jitter at a standstill does not inflate the total.
 5. Speed shows `--` below 1 km/h, matching the reference.
-6. Days are bucketed by local calendar day (`localDayKey`), not UTC.
+6. Days are bucketed by calendar day in the **MyGeotab user's** timezone
+   (`localDayKey`), not UTC and not the browser's. See the timezone section.
 
 `IDLE_SPEED_KMH = 1` matches Geotab's own definition of idling: speed below
 1 km/h with the ignition on.
@@ -334,19 +335,113 @@ Copy a working URL out of the address bar of a real database again and diff it
 against what the report generates. That beats the documentation every time, which
 is how v1.1.0 was arrived at.
 
-## Timezone (known bug, not yet fixed)
+## Timezone and time format (fixed in v1.4.0)
 
-Days are bucketed by the **browser's** timezone, not the MyGeotab user's
-`timeZoneId`. The two differ whenever the operator is not in the database's own
-timezone, and the failure is silent: wrong day boundaries and a daily distance
-that resets at the wrong moment.
+**All times are 24-hour, in the MyGeotab user's own timezone.**
 
-This is live, not theoretical. The real Trips History URL for a UK database shows
+### The bug this replaced
+
+Up to v1.3.0 days were bucketed by the **browser's** timezone via
+`Date.getFullYear()` / `getMonth()` / `getDate()`, and times were rendered with
+`toLocaleTimeString`, which follows the browser locale and gives AM/PM on a US
+machine. Both were wrong whenever the operator is not sitting in the database's
+timezone, and the day-boundary failure was silent: wrong day splits and a daily
+distance that reset at the wrong moment.
+
+It was live, not theoretical. The real Trips History URL for a UK database shows
 `startDate:'2026-08-18T23:00:00.000Z'` for "Today", so that database is on UTC+1
-while the browser running the report is on UTC+2.
+while the browser running the report was on UTC+2.
 
-The fix is to read `timeZoneId` from the session user and bucket against it
-rather than against `Date.getFullYear()` / `getMonth()` / `getDate()`.
+### How it works now
+
+`User.timeZoneId` is read from the session user. The SDK describes it as "The IANA
+Timezone Id of the user. All data will be displayed in this Timezone", which is
+exactly the contract this report needs, and an IANA id is what `Intl` wants.
+
+| Helper | Purpose |
+|---|---|
+| `setTimeZone(id, via)` | Sets the zone and drops the cached formatter |
+| `tzParts(iso)` | Wall-clock y/mo/d/h/mi/s/dow of an instant, in that zone |
+| `tzOffsetMs(utcMs)` | How far ahead of UTC the zone is at that instant |
+| `tzInstant(y,mo,d,h,mi,s)` | The UTC instant of a wall-clock time in that zone |
+
+`tzInstant` resolves the offset **twice**, because the offset at the guessed
+instant can differ from the offset at the real one across a DST change. Verified
+against Europe/London: 25 Oct 2026 is a 25-hour day and both its boundaries come
+out right, as do the 18 Aug boundaries in the ground-truth Replay URL
+(`2026-08-17T23:00:00.000Z` to `2026-08-18T22:59:59.000Z`).
+
+Four things depend on this, all of which were wrong before:
+
+- `localDayKey` — which day a row belongs to, and where daily distance resets
+- `fmtTime` — now `pad2(h):pad2(mi):pad2(s)`, always 24-hour, never locale-driven
+- `replayUrl` — the `dateRange` day boundaries, built with `tzInstant`
+- `cardDatePart` — `expandedCardIds` uses the trip's start day in the user's zone
+
+The API query window in `runReport` uses `tzInstant` too. The date pickers mean
+days in the user's timezone, so the window has to be anchored there rather than at
+the browser's midnight.
+
+### When it cannot be read
+
+`S.tzId` empty means no profile timezone was available, and everything falls back
+to the browser exactly as before. That is not silent: a notice says so and warns
+that day boundaries may be wrong. An unrecognised zone id is caught on the first
+formatter build rather than throwing on every row.
+
+The diagnostic strip above the results always states the active zone and where it
+came from, next to the Replay host.
+
+### Still browser-dependent, deliberately
+
+`fmtDayReadable` builds a weekday from `new Date(y, m-1, d)`. That is a bare
+calendar date with no instant attached, so the browser's zone cannot shift it.
+
+## Units, metric or imperial (added in v1.5.0)
+
+`User.isMetric` is read from the profile in the same `Get` that reads
+`timeZoneId`, so both regional settings cost one call. SDK type is Boolean and
+the SDK default is `true`. Description: "Whether the current regional settings is
+in metric units of measurement (or US/Imperial)."
+
+The rule that keeps this from going wrong:
+
+**Everything inside `app.js` is metric.** `LogRecord.Speed` is km/h no matter who
+is logged in, and every distance is haversine kilometres. Imperial is a display
+conversion applied at the last possible moment, in `fmtDist` and `fmtSpeed`.
+Convert any earlier and the idling threshold, the change triggers and the data
+start disagreeing with each other.
+
+| Helper | Does |
+|---|---|
+| `distUnit()` / `speedUnit()` | `"km"`/`"km/h"` or `"mi"`/`"mph"` |
+| `toDist(km)` / `toSpeed(kmh)` | Numeric conversion only, no label |
+| `fmtDist(km)` / `fmtSpeed(kmh)` | The only two places a unit label is produced |
+
+`IDLE_SPEED_KMH` stays 1 km/h in both systems, because it is Geotab's own
+definition of idling, not a user-facing figure.
+
+### Why `DETAIL_LEVELS` carries two threshold pairs
+
+Each level holds a `metric` and an `imperial` pair rather than one pair that gets
+converted. Converting 1.5 km would print "0.9 mi" in an imperial notice, which
+reads like a rounding artefact rather than a chosen setting. The imperial numbers
+are round numbers picked to sit near their metric siblings, not derived from
+them. `activeRules(key)` resolves a level into metric comparison values
+(`distKm`, `speedKmh`, used by `reduceRows`) plus display labels (`distLabel`,
+`speedLabel`, used by `describeRules`). Nothing should read `DETAIL_LEVELS`
+directly.
+
+`S.rules` is set in `runReport`, not at load, so the thresholds always match
+whichever unit system the profile read settled on.
+
+### When the read fails
+
+`S.isMetric` defaults to `true` and `S.unitsVia` stays empty, which triggers a
+notice saying units could not be read and metric is being shown. The profile
+value is only accepted when it is explicitly `true` or `false`, so an absent
+field cannot silently flip a metric database into miles. The diagnostic strip
+above the results names the active units alongside the timezone and Replay host.
 
 ## Volume guards
 
@@ -376,8 +471,15 @@ group-wide run shows output while it is still working.
 - **Status sequence.** Spot-check one vehicle-day against map playback. Every
   Idling start needs a matching Idling end, and no idling row may appear outside
   an ignition-on interval.
-- **Day boundaries.** Use a vehicle driving across local midnight and confirm the
-  day splits correctly and Daily Distance resets.
+- **Day boundaries.** Use a vehicle driving across midnight and confirm the day
+  splits correctly and Daily Distance resets. The maths is unit-checked against
+  Europe/London including the DST day, but the profile-timezone read itself is
+  untested against a live session as of v1.5.0. The strip above the results names
+  the active zone; confirm it matches the timezone on the MyGeotab profile.
+- **Units.** Log in as a US/Imperial profile and confirm the strip says miles and
+  mph, that every distance and speed on screen, in the CSV and in the PDF carries
+  the same unit, and that the detail notice quotes the imperial thresholds. Then
+  switch the profile to metric and confirm it flips on the next run.
 - **Volume.** Run a group over a week; confirm the notices fire and the progress
   line moves rather than appearing to hang.
 - **Replay.** Click three rows from different days and confirm each lands on the
@@ -401,7 +503,7 @@ That is the URL in `config.json`. `index.html` and the whole `src/` folder are
 served from the repository root, so the relative paths in `index.html` work
 unchanged.
 
-Cache note: the asset links are versioned with `?v=1.3.0`. Bump that query
+Cache note: the asset links are versioned with `?v=1.5.0`. Bump that query
 string in `index.html` whenever `app.js`, `activity.css` or `styles.css` change,
 otherwise MyGeotab will keep serving the cached copy.
 

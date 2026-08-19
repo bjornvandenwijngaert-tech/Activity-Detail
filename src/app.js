@@ -19,7 +19,13 @@
 
   // ─── Constants ───────────────────────────────────────────────────────────
   // Geotab defines idling as speed below 1 km/h with the ignition on.
+  //
+  // Every speed and distance INSIDE this file is metric, because that is what
+  // the API returns: LogRecord.speed is km/h regardless of who is logged in.
+  // Imperial is a display conversion applied at the last moment, in fmtDist and
+  // fmtSpeed. Do not convert earlier or thresholds start disagreeing with data.
   var IDLE_SPEED_KMH  = 1;
+  var KM_PER_MILE     = 1.609344;
   var MAX_RECORDS     = 50000;  // hard cap on a single Get
   var SPLIT_DEPTH     = 6;      // how many times to halve a window that hits the cap
   var GEOCODE_CHUNK   = 400;    // GetAddresses accepts up to 400 coordinates per call
@@ -50,12 +56,34 @@
   //   minGapMs    floor: never two rows closer than this, so a roundabout does
   //               not produce six rows in ten seconds. Status changes ignore
   //               the floor.
+  //
+  // Each level carries a metric and an imperial pair rather than one pair that
+  // gets converted. Converting 1.5 km would put "0.9 mi" in front of an imperial
+  // user, which reads like a rounding artefact. These are round numbers in both
+  // systems and close enough to each other that the output density matches.
   var DETAIL_LEVELS = {
-    key:      { distKm: 5,   speedKmh: 30, headingDeg: 90, maxGapMs: 900000, minGapMs: 60000 },
-    balanced: { distKm: 1.5, speedKmh: 20, headingDeg: 45, maxGapMs: 300000, minGapMs: 30000 },
-    detailed: { distKm: 0.5, speedKmh: 10, headingDeg: 30, maxGapMs: 120000, minGapMs: 15000 },
+    key:      { metric: { dist: 5,   speed: 30 }, imperial: { dist: 3,   speed: 20 }, headingDeg: 90, maxGapMs: 900000, minGapMs: 60000 },
+    balanced: { metric: { dist: 1.5, speed: 20 }, imperial: { dist: 1,   speed: 12 }, headingDeg: 45, maxGapMs: 300000, minGapMs: 30000 },
+    detailed: { metric: { dist: 0.5, speed: 10 }, imperial: { dist: 0.3, speed: 6  }, headingDeg: 30, maxGapMs: 120000, minGapMs: 15000 },
     all:      null
   };
+
+  // Resolve a level into the metric thresholds the engine compares against, plus
+  // the labels to show the operator in their own units.
+  function activeRules(key) {
+    var L = DETAIL_LEVELS[key];
+    if (!L) return null;
+    var u = S.isMetric ? L.metric : L.imperial;
+    return {
+      distKm:     S.isMetric ? u.dist  : u.dist  * KM_PER_MILE,
+      speedKmh:   S.isMetric ? u.speed : u.speed * KM_PER_MILE,
+      distLabel:  u.dist  + " " + distUnit(),
+      speedLabel: u.speed + " " + speedUnit(),
+      headingDeg: L.headingDeg,
+      maxGapMs:   L.maxGapMs,
+      minGapMs:   L.minGapMs
+    };
+  }
 
   // ─── State ───────────────────────────────────────────────────────────────
   var S = {
@@ -68,7 +96,13 @@
     devices:    [],     // [{ id, name, days: [{ dayKey, rows, distKm, idleMins }] }]
     warnings:   [],
     running:    false,
-    rules:      null    // active DETAIL_LEVELS entry; null shows every GPS log
+    rules:      null,   // active DETAIL_LEVELS entry; null shows every GPS log
+    tzId:       "",     // MyGeotab User.timeZoneId; "" falls back to the browser
+    tzVia:      "",
+    isMetric:   true,   // MyGeotab User.isMetric; SDK default is true
+    unitsVia:   "",
+    userName:   "",
+    datesTouched: false // true once the operator has picked a date themselves
   };
 
   // ─── Generic helpers ─────────────────────────────────────────────────────
@@ -92,21 +126,99 @@
       .replace(/'/g, "&#39;");
   }
 
-  function fmtDateInput(d) { return d.toISOString().slice(0, 10); }
+  // ─── Time and timezone ───────────────────────────────────────────────────
+  // Everything on screen is rendered in the MyGeotab user's own timezone
+  // (`User.timeZoneId`), not the browser's.
+  //
+  // Before v1.4.0 this used Date.getHours() and friends, which read the machine
+  // running the browser. Whenever the operator is not sitting in the database's
+  // timezone the days were bucketed at the wrong boundary and the daily distance
+  // reset at the wrong moment, silently. That is a real gap, not a theoretical
+  // one: a UK database reports midnight as 23:00Z while a browser on UTC+2 calls
+  // that 01:00 the next day.
+  //
+  // S.tzId empty means no profile timezone was readable, and everything falls
+  // back to the browser as before, with a notice saying so.
 
-  // Local calendar day, not UTC. A vehicle driving at 23:30 local must land on
-  // the local day, otherwise the daily distance resets in the wrong place.
+  var TZ_FMT = null;
+
+  function setTimeZone(id, via) {
+    S.tzId  = id || "";
+    S.tzVia = via || "";
+    TZ_FMT  = null;   // cached formatter is bound to the old zone
+  }
+
+  function tzFormatter() {
+    if (TZ_FMT) return TZ_FMT;
+    var opts = {
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hourCycle: "h23", weekday: "short"
+    };
+    if (S.tzId) {
+      try {
+        opts.timeZone = S.tzId;
+        TZ_FMT = new Intl.DateTimeFormat("en-GB", opts);
+        return TZ_FMT;
+      } catch (e) {
+        // An unrecognised zone id would otherwise throw on every single row.
+        delete opts.timeZone;
+        setTimeZone("", "");
+        addWarning("The timezone on your MyGeotab profile was not recognised, so times are shown in this computer's timezone instead.");
+      }
+    }
+    TZ_FMT = new Intl.DateTimeFormat("en-GB", opts);
+    return TZ_FMT;
+  }
+
+  // Wall-clock parts of an instant, in the report timezone.
+  function tzParts(iso) {
+    var d = iso instanceof Date ? iso : new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    var p = tzFormatter().formatToParts(d), o = {}, i;
+    for (i = 0; i < p.length; i++) o[p[i].type] = p[i].value;
+    return {
+      y: +o.year, mo: +o.month, d: +o.day,
+      h: (+o.hour) % 24, mi: +o.minute, s: +o.second,
+      dow: o.weekday
+    };
+  }
+
+  // How far the report timezone is ahead of UTC at a given instant.
+  function tzOffsetMs(utcMs) {
+    var p = tzParts(new Date(utcMs));
+    if (!p) return 0;
+    return Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - (utcMs - (utcMs % 1000));
+  }
+
+  // The UTC instant of a given wall-clock time in the report timezone. The
+  // offset is resolved twice because the offset at the guessed instant can
+  // differ from the offset at the real one across a DST change.
+  function tzInstant(y, mo, d, h, mi, s) {
+    var guess = Date.UTC(y, mo - 1, d, h, mi, s);
+    var t = guess - tzOffsetMs(guess);
+    return guess - tzOffsetMs(t);
+  }
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  function fmtDateInput(d) {
+    var p = tzParts(d);
+    return p ? p.y + "-" + pad2(p.mo) + "-" + pad2(p.d) : "";
+  }
+
+  // Calendar day in the report timezone. A vehicle driving at 23:30 must land on
+  // that day, otherwise the daily distance resets in the wrong place.
   function localDayKey(iso) {
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return "";
-    var m = d.getMonth() + 1, day = d.getDate();
-    return d.getFullYear() + "-" + (m < 10 ? "0" : "") + m + "-" + (day < 10 ? "0" : "") + day;
+    var p = tzParts(iso);
+    return p ? p.y + "-" + pad2(p.mo) + "-" + pad2(p.d) : "";
   }
 
   function fmtDayReadable(dayKey) {
-    var parts = dayKey.split("-");
-    var d = new Date(+parts[0], +parts[1] - 1, +parts[2]);
-    return d.toLocaleDateString(undefined, { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+    var p = dayKey.split("-");
+    // A bare calendar date with no instant attached, so plain Date is correct.
+    var d = new Date(+p[0], +p[1] - 1, +p[2]);
+    return DOW_SHORT[d.getDay()] + " " + pad2(+p[2]) + " " + MON_SHORT[+p[1] - 1] + " " + p[0];
   }
 
   function fmtDayShort(dayKey) {
@@ -114,13 +226,19 @@
     return p[2] + "/" + p[1] + "/" + p[0];
   }
 
+  // 24-hour throughout, deliberately. toLocaleTimeString follows the browser
+  // locale and gives AM/PM on a US machine, which does not match the report
+  // being replicated.
   function fmtTime(iso) {
-    return iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "--";
+    var p = tzParts(iso);
+    return p ? pad2(p.h) + ":" + pad2(p.mi) + ":" + pad2(p.s) : "--";
   }
 
   function tzLabel(iso) {
     try {
-      var parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(new Date(iso));
+      var opts = { timeZoneName: "short" };
+      if (S.tzId) opts.timeZone = S.tzId;
+      var parts = new Intl.DateTimeFormat("en-GB", opts).formatToParts(new Date(iso));
       for (var i = 0; i < parts.length; i++) { if (parts[i].type === "timeZoneName") return parts[i].value; }
     } catch (e) {}
     return "";
@@ -145,10 +263,24 @@
     return h > 0 ? h + "h " + m + "m" : m + "m";
   }
 
-  function fmtKm(km) {
+  // ─── Units ───────────────────────────────────────────────────────────────
+  // Read from User.isMetric. The API is always metric, so these convert only at
+  // the point of display.
+  function distUnit()  { return S.isMetric ? "km"   : "mi"; }
+  function speedUnit() { return S.isMetric ? "km/h" : "mph"; }
+  function toDist(km)   { return S.isMetric ? km   : km   / KM_PER_MILE; }
+  function toSpeed(kmh) { return S.isMetric ? kmh  : kmh  / KM_PER_MILE; }
+
+  function fmtDist(km) {
     if (km == null || isNaN(km)) return "";
-    if (km === 0) return "0 km";
-    return String(parseFloat(km.toFixed(2))) + " km";
+    var v = toDist(km);
+    if (v === 0) return "0 " + distUnit();
+    return String(parseFloat(v.toFixed(2))) + " " + distUnit();
+  }
+
+  function fmtSpeed(kmh) {
+    if (kmh == null || isNaN(kmh)) return "--";
+    return Math.round(toSpeed(kmh)) + " " + speedUnit();
   }
 
   function haversineKm(a, b) {
@@ -221,6 +353,46 @@
           sel.appendChild(o);
         });
     });
+  }
+
+  // The two regional settings the report has to honour, both on the User record:
+  //   timeZoneId  IANA id such as "Europe/London", which is what Intl wants
+  //   isMetric    false means US/Imperial, so miles and mph
+  // One Get covers both.
+  function loadUserPrefs() {
+    if (!S.userName) { onPrefsKnown(); return; }
+    apiCall("Get", { typeName: "User", search: { name: S.userName } }, function (users) {
+      var u = users && users[0];
+      if (u) {
+        if (u.timeZoneId) setTimeZone(u.timeZoneId, "your MyGeotab profile");
+        // Explicitly false, not just falsy: an absent field must not silently
+        // flip a metric database into miles.
+        if (u.isMetric === false || u.isMetric === true) {
+          S.isMetric = u.isMetric;
+          S.unitsVia = "your MyGeotab profile";
+        }
+      }
+      onPrefsKnown();
+    }, function () { onPrefsKnown(); });
+  }
+
+  function onPrefsKnown() {
+    if (!S.tzId) {
+      addWarning("Your MyGeotab profile timezone could not be read, so days and times are shown in this computer's timezone. If the two differ, day boundaries and daily distance will be wrong.");
+    }
+    if (!S.unitsVia) {
+      addWarning("Your MyGeotab profile units could not be read, so distances and speeds are shown in metric. Check the figures against MyGeotab if your profile is set to US/Imperial.");
+    }
+    // The default dates were filled in before the timezone was known. Correct
+    // them unless the operator has already chosen their own.
+    if (!S.datesTouched) applyDefaultDates();
+    renderLinkInfo();
+  }
+
+  function applyDefaultDates() {
+    var today = fmtDateInput(new Date());
+    $("val-from").value = today;
+    $("val-to").value   = today;
   }
 
   function loadDevices(groupId) {
@@ -505,9 +677,9 @@
             var lastSpd = lastKept.speed == null ? 0 : lastKept.speed;
 
             if (r.distKm - lastKept.distKm >= rules.distKm) {
-              why = "travelled " + rules.distKm + " km";
+              why = "travelled " + rules.distLabel;
             } else if (Math.abs(spd - lastSpd) >= rules.speedKmh) {
-              why = "speed changed by " + rules.speedKmh + " km/h or more";
+              why = "speed changed by " + rules.speedLabel + " or more";
             } else if (r.hdg != null && lastKept.hdg != null && spd >= IDLE_SPEED_KMH &&
                        angleDelta(r.hdg, lastKept.hdg) >= rules.headingDeg) {
               why = "changed direction by " + rules.headingDeg + " degrees or more";
@@ -531,7 +703,7 @@
   // Plain-language version of the active rules, for the notice above the table.
   function describeRules(r) {
     return "A row is written whenever something changes: any status change, " +
-      r.distKm + " km travelled, a speed change of " + r.speedKmh + " km/h, a turn of " +
+      r.distLabel + " travelled, a speed change of " + r.speedLabel + ", a turn of " +
       r.headingDeg + " degrees, or " + Math.round(r.maxGapMs / 60000) +
       " minutes with none of those. Rows are never closer together than " +
       Math.round(r.minGapMs / 1000) + " seconds, except for status changes. " +
@@ -637,17 +809,24 @@
   var DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   var MON_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
+  // MyGeotab builds this id from the trip's start in the *user's* timezone, so
+  // it has to come from tzParts rather than the browser clock.
   function cardDatePart(iso) {
-    var d = new Date(iso);
-    return DOW_SHORT[d.getDay()] + "+" + MON_SHORT[d.getMonth()] + "+" + d.getDate();
+    var p = tzParts(iso);
+    if (!p) return "";
+    return p.dow + "+" + MON_SHORT[p.mo - 1] + "+" + p.d;
   }
 
   function replayUrl(deviceId, iso, trip) {
     if (!S.server || !S.dbName) return "";
 
     var d = new Date(iso);
-    var dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
-    var dayEnd   = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 0);
+    var wall = tzParts(iso);
+    if (!wall) return "";
+    // Midnight to 23:59:59 of that day in the user's timezone, as UTC instants,
+    // which is what MyGeotab itself puts in dateRange.
+    var dayStart = new Date(tzInstant(wall.y, wall.mo, wall.d, 0, 0, 0));
+    var dayEnd   = new Date(tzInstant(wall.y, wall.mo, wall.d, 23, 59, 59));
 
     var segStart, segStop, cardId = "";
     if (trip) {
@@ -705,14 +884,21 @@
   function renderLinkInfo() {
     var el = $("val-linkinfo");
     if (!el) return;
-    if (S.server && S.dbName) {
-      el.innerHTML = "Replay links open <code>" + esc(S.server + "/" + S.dbName)
-        + "</code> <span class='val-muted'>(host read from " + esc(S.hostVia || "session") + ")</span>";
-      el.classList.remove("hidden");
-    } else {
-      el.innerHTML = "Replay links are disabled: could not work out the MyGeotab server or database name for this page.";
-      el.classList.remove("hidden");
-    }
+
+    var tz = S.tzId
+      ? "Times are 24-hour in <code>" + esc(S.tzId) + "</code> <span class='val-muted'>(from " + esc(S.tzVia) + ")</span>"
+      : "Times are 24-hour in <code>this computer's timezone</code> <span class='val-muted'>(no profile timezone available)</span>";
+
+    var host = (S.server && S.dbName)
+      ? "Replay links open <code>" + esc(S.server + "/" + S.dbName)
+        + "</code> <span class='val-muted'>(host read from " + esc(S.hostVia || "session") + ")</span>"
+      : "Replay links are disabled: could not work out the MyGeotab server or database name for this page.";
+
+    var units = "Distances in <code>" + distUnit() + "</code>, speeds in <code>" + speedUnit() + "</code> "
+      + "<span class='val-muted'>(" + (S.unitsVia ? "from " + esc(S.unitsVia) : "profile units not available, showing metric") + ")</span>";
+
+    el.innerHTML = tz + " &nbsp;&middot;&nbsp; " + units + " &nbsp;&middot;&nbsp; " + host;
+    el.classList.remove("hidden");
   }
 
   // Only reached when no host resolved, so no URL could be built at all. The
@@ -744,7 +930,7 @@
 
     var html = "<h3 class='val-vehicle-name'>" + esc(dev.name) + "</h3>"
       + "<div class='val-vehicle-meta'>" + dev.days.length + " day" + (dev.days.length === 1 ? "" : "s")
-      + " &middot; " + totalRows.toLocaleString() + " events &middot; " + fmtKm(totalKm)
+      + " &middot; " + totalRows.toLocaleString() + " events &middot; " + fmtDist(totalKm)
       + " &middot; " + fmtDurWhole(totalIdle) + " idling</div>";
 
     dev.days.forEach(function (d) {
@@ -755,7 +941,7 @@
           : esc(fmtTime(r.t));
         var speedCell = r.speed == null || r.speed < IDLE_SPEED_KMH
           ? "<span class='val-muted'>--</span>"
-          : Math.round(r.speed) + " km/h";
+          : esc(fmtSpeed(r.speed));
         var url = replayUrl(dev.id, r.t, r.trip);
         body += "<tr>"
           // The "why" tooltip is what makes an uneven row count explainable:
@@ -763,7 +949,7 @@
           + "<td class='val-num'" + (r.why ? " title='Shown because: " + esc(r.why) + "'" : "") + ">" + dateCell + "</td>"
           + "<td><span class='val-status'><span class='val-dot val-dot-" + r.cls + "'></span>" + esc(r.status) + "</span></td>"
           + "<td class='val-dur'>" + esc(r.duration) + "</td>"
-          + "<td class='val-num'>" + esc(fmtKm(r.distKm)) + "</td>"
+          + "<td class='val-num'>" + esc(fmtDist(r.distKm)) + "</td>"
           + "<td class='val-num'>" + speedCell + "</td>"
           + "<td>" + esc(addressFor(r)) + "</td>"
           + "<td class='val-coords'>" + r.lat.toFixed(5) + ", " + r.lng.toFixed(5) + "</td>"
@@ -778,7 +964,7 @@
 
       body += "<tr class='val-day-total'>"
         + "<td colspan='3'>" + esc(fmtDayReadable(d.dayKey)) + " total</td>"
-        + "<td class='val-num'>" + esc(fmtKm(d.distKm)) + "</td>"
+        + "<td class='val-num'>" + esc(fmtDist(d.distKm)) + "</td>"
         + "<td colspan='4'>" + esc(fmtDurWhole(d.idleMins)) + " idling &middot; " + esc(eventCount(d)) + "</td>"
         + "</tr>";
 
@@ -814,7 +1000,7 @@
     var cards = [
       ["Vehicles", S.devices.length, ""],
       ["Days", Object.keys(dayKeys).length, ""],
-      ["Distance", parseFloat(totalKm.toFixed(1)), " km"],
+      ["Distance", parseFloat(toDist(totalKm).toFixed(1)), " " + distUnit()],
       ["Idling", fmtDurWhole(totalIdle), ""],
       ["Events", totalRows.toLocaleString(), ""]
     ].map(function (c) {
@@ -838,8 +1024,8 @@
             fmtTime(r.t),
             r.status,
             r.duration,
-            fmtKm(r.distKm),
-            (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : Math.round(r.speed) + " km/h",
+            fmtDist(r.distKm),
+            (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : fmtSpeed(r.speed),
             addressFor(r),
             r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
             replayUrl(dev.id, r.t, r.trip)
@@ -905,8 +1091,8 @@
           var r = d.rows[ri];
           var rUrl = replayUrl(dev.id, r.t, r.trip);
           body.push([
-            fmtTime(r.t), r.status, r.duration, fmtKm(r.distKm),
-            (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : Math.round(r.speed) + " km/h",
+            fmtTime(r.t), r.status, r.duration, fmtDist(r.distKm),
+            (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : fmtSpeed(r.speed),
             addressFor(r), r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
             rUrl ? "REPLAY" : ""
           ]);
@@ -917,7 +1103,7 @@
           { content: "Day total", styles: { fontStyle: "bold", fillColor: [245, 245, 245] } },
           { content: "", styles: { fillColor: [245, 245, 245] } },
           { content: fmtDurWhole(d.idleMins) + " idling", styles: { fontStyle: "bold", fillColor: [245, 245, 245] } },
-          { content: fmtKm(d.distKm), styles: { fontStyle: "bold", fillColor: [245, 245, 245] } },
+          { content: fmtDist(d.distKm), styles: { fontStyle: "bold", fillColor: [245, 245, 245] } },
           { content: "", styles: { fillColor: [245, 245, 245] } },
           { content: eventCount(d), styles: { fillColor: [245, 245, 245] } },
           { content: "", styles: { fillColor: [245, 245, 245] } },
@@ -977,14 +1163,19 @@
 
     var groupId  = $("val-group").value;
     var deviceId = $("val-vehicle").value;
-    var fromIso = new Date(from + "T00:00:00").toISOString();
-    var toIso   = new Date(to   + "T23:59:59").toISOString();
+    // The date pickers mean days in the user's timezone, so the API window has
+    // to be anchored there too, not at the browser's midnight.
+    var f = from.split("-"), t = to.split("-");
+    var fromIso = new Date(tzInstant(+f[0], +f[1], +f[2], 0, 0, 0)).toISOString();
+    var toIso   = new Date(tzInstant(+t[0], +t[1], +t[2], 23, 59, 59)).toISOString();
 
     S.running = true;
     S.devices = [];
     S.warnings = [];
     S.addrMap = {};
-    S.rules = DETAIL_LEVELS[$("val-detail").value] || null;
+    // Resolved here, not at load, so the thresholds match whichever unit system
+    // the profile read settled on.
+    S.rules = activeRules($("val-detail").value);
     if (S.rules) addWarning(describeRules(S.rules));
     if (!resolveHost()) {
       addWarning("The MyGeotab server or database name could not be worked out for this page, so the Replay links will not work. Everything else in the report is unaffected.");
@@ -1073,10 +1264,10 @@
 
   // ─── Wiring ──────────────────────────────────────────────────────────────
   function setup() {
-    var today = new Date();
-    $("val-from").value = fmtDateInput(today);
-    $("val-to").value   = fmtDateInput(today);
+    applyDefaultDates();
 
+    $("val-from").addEventListener("change", function () { S.datesTouched = true; });
+    $("val-to").addEventListener("change",   function () { S.datesTouched = true; });
     $("val-group").addEventListener("change", function () { loadDevices(this.value); });
     $("val-run").addEventListener("click", runReport);
     $("val-csv").addEventListener("click", exportCsv);
@@ -1109,9 +1300,13 @@
                 S.dbName = session.database;
                 $("val-db").textContent = session.database;
               }
+              if (session && session.userName) S.userName = session.userName;
               resolveHost();
               renderLinkInfo();
+              loadUserPrefs();
             });
+          } else {
+            onPrefsKnown();
           }
           setup();
           resolveHost();
