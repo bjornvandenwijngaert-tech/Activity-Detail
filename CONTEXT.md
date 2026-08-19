@@ -128,6 +128,24 @@ median 16 seconds, 9 over 45 seconds, 2 over 2 minutes, longest 2.6 minutes. Tha
 the red-light and traffic idling the whole v1.7.2 conversation was about. Removing it
 to match MyGeotab would delete the feature.
 
+**But 23.74 is not all traffic. `Trip.stop` fires before the vehicle actually stops.**
+Measured with `.diag/arrival-check.js` across all 16 trips: the ignition-off that ends
+a trip lands **1 to 50 seconds after** `Trip.stop`, on 15 of 16 (the exception is a trip
+whose stop has no adjacent off). So the standstill on arrival, engine still running,
+falls *inside* `[trip.start, trip.stop]` and plain overlap arithmetic calls it traffic.
+On 18 Aug that mislabelled 15 runs and **5.99 min**. The real split is **38.46 stopped,
+17.75 mid-journey**. `splitIdle` corrects for it: a run that ended because the ignition
+went off is arrival idling by definition and goes wholly to stopped.
+
+The departure side needs no equivalent rule. `Trip.start` is the first movement, so
+warm-up idling falls outside the trip window on its own, and the data shows zero
+departure misclassifications.
+
+An ignition-only rule ("moved before and after within one ignition cycle") cannot
+replace the trip list. It would call the 24.4 min parked stop at 07:48:55..08:13:19
+mid-journey, because the vehicle drove, sat 24 minutes with the engine running, and
+drove on, all inside one ignition cycle.
+
 **Consequence: do not "fix" this by tuning thresholds.** The sweep in
 `.diag/idle-sweep.js` shows why nothing in that direction works. Varying the speed
 threshold from 0.1 to 3 km/h moves the total between 56.2 and 58.0. Turning the v1.7.2
@@ -193,10 +211,15 @@ How it works:
 - `buildActivity` now records every idle run in `day.idleRuns` as well as adding to
   `day.idleMins`. It has to: the split is only knowable once the trip list arrives, which
   is after the engine has finished, and a total cannot be divided after the fact.
-- `closeIdle(endMs)` replaced three separate hand-rolled `day.idleMins +=` sites. They had
-  drifted into three copies of the same three lines.
+- `closeIdle(endMs, endedBy)` replaced three separate hand-rolled `day.idleMins +=` sites.
+  They had drifted into three copies of the same three lines. `endedBy` is `"moved"`,
+  `"ignitionOff"` or `"endOfRange"` and records why the run finished, which `splitIdle`
+  cannot work out for itself.
 - `splitIdle(days, trips)` attributes minutes **by overlap**, so a run straddling a trip
-  boundary is divided rather than assigned whole.
+  boundary is divided rather than assigned whole. Except a run with
+  `endedBy === "ignitionOff"`, which goes wholly to stopped: `Trip.stop` lags the real
+  halt by 1 to 50 seconds, so overlap alone calls arrival idling traffic. See the
+  `Trip.stop` note above. `"endOfRange"` stays on plain overlap as the neutral choice.
 - Rows are tagged by whichever side holds most of their run, not per row. Tagging per row
   would flip the last row of a stop to the in-traffic colour, because an `Idling end`
   lands exactly on the departure and so falls inside the trip that just started. One run
@@ -205,7 +228,7 @@ How it works:
   of asserting a false 0.
 
 Verified by `.diag/split-test.js`, 24 assertions, at all four detail levels: distance
-429.71 km and idle 56.20 min unchanged, stopped 32.47, mid-journey 23.74, halves summing
+429.71 km and idle 56.20 min unchanged, stopped 38.46, mid-journey 17.75, halves summing
 to the total. `engine-harness.js` row counts identical at every level. `retry-test.js`
 still 37/37.
 

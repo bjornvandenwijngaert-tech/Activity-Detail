@@ -785,11 +785,31 @@
   // is divided rather than assigned whole. Rows are tagged by whichever side
   // holds most of their run, because a single run reading as two colours part
   // way down the table would look like a fault rather than a nuance.
+  //
+  // Overlap alone is not enough, because Trip.stop is not the moment the vehicle
+  // came to rest. Measured across 16 trips on one vehicle, the ignition-off that
+  // ends a trip lands 1 to 50 seconds AFTER Trip.stop, so the arrival standstill
+  // sits inside the trip window and overlap calls it traffic. On 18 Aug 2026 that
+  // mislabelled 8 runs and 6.87 minutes. So a run that ended because the engine
+  // was switched off is arrival idling by definition and goes wholly to stopped,
+  // whatever the trip times say.
+  //
+  // The departure side needs no such rule: Trip.start is the first movement, so
+  // warm-up idling falls outside the trip window on its own. The data shows zero
+  // departure misclassifications. And an ignition-only rule cannot replace the
+  // trips: a vehicle that drove, sat 24 minutes with the engine running, then
+  // drove on stays inside one ignition cycle, and only the trip list knows it
+  // was parked.
   function splitIdle(days, trips) {
     if (!trips.length) return;   // nothing to classify against; leave untagged
     days.forEach(function (day) {
       var drive = 0, stop = 0;
       (day.idleRuns || []).forEach(function (run) {
+        if (run.endedBy === "ignitionOff") {
+          stop += (run.endMs - run.startMs) / 60000;
+          run.cls = "idlestop";
+          return;
+        }
         var within = 0;
         for (var i = 0; i < trips.length; i++) {
           var lo = Math.max(run.startMs, trips[i].startMs);
@@ -931,10 +951,15 @@
     // traffic. That split needs the trip list, which arrives after this engine
     // has finished. Keeping the runs is what lets splitIdle do the attribution
     // later without re-deriving anything.
-    function closeIdle(endMs) {
+    // endedBy records WHY the run finished, which splitIdle cannot work out for
+    // itself and cannot do without. See the note there on arrival idling.
+    //   "moved"        the vehicle drove off again
+    //   "ignitionOff"  the engine was switched off
+    //   "endOfRange"   the report window closed with the vehicle still idling
+    function closeIdle(endMs, endedBy) {
       var mins = (endMs - idleStartMs) / 60000;
       day.idleMins += mins;
-      day.idleRuns.push({ startMs: idleStartMs, endMs: endMs });
+      day.idleRuns.push({ startMs: idleStartMs, endMs: endMs, endedBy: endedBy });
       inIdle = false;
       return mins;
     }
@@ -965,7 +990,7 @@
     // for a departure with no jitter.
     function confirmPending() {
       var b = pend.buf, first = b[0];
-      var mins = closeIdle(first.ms);
+      var mins = closeIdle(first.ms, "moved");
       pushAt(first.t, "Idling end", "idle", first,
              "Idling time: [" + fmtDurPrecise(mins) + "]", true);
       for (var k = 1; k < b.length; k++) pushAt(b[k].t, "Moving", "moving", b[k], "", true);
@@ -1012,7 +1037,7 @@
           pushAt(tr.t, "Ignition on", "ignon", at, "", false);
         } else {
           if (inIdle) {
-            var im = closeIdle(tr.ms);
+            var im = closeIdle(tr.ms, "ignitionOff");
             pushAt(tr.t, "Idling end", "idle", at, "Idling time: [" + fmtDurPrecise(im) + "]", false);
           }
           pushAt(tr.t, "Ignition off", "ignoff", at, "", false);
@@ -1072,7 +1097,7 @@
       var lastPt = realPts[realPts.length - 1];
       var openMins = (lastPt.ms - idleStartMs) / 60000;
       if (openMins > 0) {
-        closeIdle(lastPt.ms);
+        closeIdle(lastPt.ms, "endOfRange");
         day.rows.push({
           t: lastPt.t, status: "Idling end", cls: "idle",
           duration: "Idling time: [" + fmtDurPrecise(openMins) + "] (still idling at end of range)",
@@ -1448,8 +1473,7 @@
       + " stopped with the engine running</span>"
       + "<span class='val-ins val-ins-drive'>" + esc(fmtDurWhole(d.idleDriveMins))
       + " standing still mid-journey</span>"
-      + "<span class='val-ins-note'>" + stopPct + "% of the idling happened while parked. "
-      + "MyGeotab's Trips History counts only that part.</span>"
+      + "<span class='val-ins-note'>" + stopPct + "% of the idling happened while parked.</span>"
       + "</div>";
   }
 
