@@ -4,10 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Vehicle Activity Log</title>
-  <link rel="stylesheet" href="src/styles.css?v=1.8.1" />
-  <link rel="stylesheet" href="src/activity.css?v=1.8.1" />
+  <link rel="stylesheet" href="src/styles.css?v=1.9.0" />
+  <link rel="stylesheet" href="src/activity.css?v=1.9.0" />
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 </head>
 <body>
   <div id="app">
@@ -22,7 +23,7 @@
         <span class="header-title">Vehicle <span>Activity Log</span></span>
       </div>
       <div class="header-meta">
-        <span class="version-badge">v1.8.1</span>
+        <span class="version-badge">v1.9.0</span>
       </div>
     </header>
 
@@ -45,6 +46,11 @@
             <select id="val-vehicle" class="select" style="min-width:180px">
               <option value="">All vehicles in group</option>
             </select>
+            <select id="val-range" class="select" style="min-width:130px" title="Sets how the To date follows the From date.">
+              <option value="day" selected>1 day</option>
+              <option value="week">7 days</option>
+              <option value="custom">Custom range</option>
+            </select>
             <input type="date" id="val-from" class="input-date" />
             <input type="date" id="val-to" class="input-date" />
             <select id="val-detail" class="select" style="min-width:170px" title="A row is written whenever something changes: status, distance travelled, speed, or direction. This sets how big a change has to be.">
@@ -54,6 +60,7 @@
               <option value="all">Every GPS log</option>
             </select>
             <button id="val-run" class="btn btn-primary">Run</button>
+            <button id="val-xlsx" class="btn btn-secondary hidden">Export Excel</button>
             <button id="val-csv" class="btn btn-secondary hidden">Export CSV</button>
             <button id="val-pdf" class="btn btn-secondary hidden">Export PDF</button>
           </div>
@@ -71,7 +78,7 @@
 
   </div>
 
-  <script src="src/logo-data.js?v=1.8.1"></script>
-  <script src="src/app.js?v=1.8.1"></script>
+  <script src="src/logo-data.js?v=1.9.0"></script>
+  <script src="src/app.js?v=1.9.0"></script>
 </body>
 </html>

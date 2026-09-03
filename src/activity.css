@@ -131,9 +131,104 @@
   border-radius: 3px;
 }
 
-.val-vehicle-block { margin-bottom: 24px; }
+.val-vehicle-block { margin-bottom: 12px; }
 .val-vehicle-name  { margin: 0 0 2px; font-size: 15px; font-weight: 700; color: var(--text); }
 .val-vehicle-meta  { color: var(--text-muted); font-size: 12px; margin-bottom: 8px; }
+
+/* Summary-first result view. Vehicle and day blocks collapse to one line and
+   only render the full table when opened, which keeps 300+ vehicle runs
+   readable at fleet level. */
+.val-vehicle-fold {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.val-vehicle-summary,
+.val-day-summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.val-vehicle-summary::-webkit-details-marker,
+.val-day-summary::-webkit-details-marker { display: none; }
+
+.val-vehicle-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px;
+  border-left: 4px solid var(--accent);
+}
+
+.val-vehicle-summary::before,
+.val-day-summary::before {
+  content: "";
+  width: 0;
+  height: 0;
+  flex: none;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform .15s;
+}
+
+.val-vehicle-fold[open] > .val-vehicle-summary::before,
+.val-day-fold[open] > .val-day-summary::before { transform: rotate(90deg); }
+
+.val-vehicle-summary-main {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.val-vehicle-summary-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.val-vehicle-body {
+  padding: 10px 12px 12px;
+  background: var(--surface-2);
+  border-top: 1px solid var(--border);
+}
+
+.val-day-fold {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.val-day-fold + .val-day-fold { margin-top: 10px; }
+
+.val-day-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 11px;
+}
+
+.val-day-summary-main {
+  font-weight: 700;
+  color: var(--text-2);
+}
+
+.val-day-summary-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.val-day-body {
+  padding: 0 10px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.val-day-body .val-insight { margin: 8px 0 8px; }
 
 .val-day-head {
   font-weight: 700;

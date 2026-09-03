@@ -26,7 +26,7 @@
   // fmtSpeed. Do not convert earlier or thresholds start disagreeing with data.
   // Stamped into the copied diagnostics, so a pasted failure report says which
   // build produced it. Keep in step with index.html and config.json.
-  var APP_VERSION     = "1.8.1";
+  var APP_VERSION     = "1.9.0";
 
   var IDLE_SPEED_KMH  = 1;
   var IDLE_RESUME_KM  = 0.05;   // 50 m of ground covered ends a stop
@@ -372,6 +372,20 @@
     return p ? p.y + "-" + pad2(p.mo) + "-" + pad2(p.d) : "";
   }
 
+  // Date input helpers use UTC so adding days is stable across DST changes.
+  function parseDateInput(v) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v || "");
+    if (!m) return null;
+    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  }
+
+  function addDaysDateInput(v, days) {
+    var d = parseDateInput(v);
+    if (!d) return v || "";
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+  }
+
   // Calendar day in the report timezone. A vehicle driving at 23:30 must land on
   // that day, otherwise the daily distance resets in the wrong place.
   function localDayKey(iso) {
@@ -637,10 +651,36 @@
     renderLinkInfo();
   }
 
+  function selectedRangeMode() {
+    var sel = $("val-range");
+    return sel ? sel.value : "day";
+  }
+
+  function syncToDateFromFromDate() {
+    var from = $("val-from").value;
+    var mode = selectedRangeMode();
+    if (!from || mode === "custom") return;
+    if (mode === "week") {
+      $("val-to").value = addDaysDateInput(from, 6);
+    } else {
+      $("val-to").value = from;
+    }
+  }
+
+  function applyRangeModeUi() {
+    var toEl = $("val-to");
+    if (!toEl) return;
+    var lockTo = selectedRangeMode() !== "custom";
+    toEl.disabled = lockTo;
+    toEl.title = lockTo ? "Set by the selected range" : "";
+    if (lockTo) syncToDateFromFromDate();
+  }
+
   function applyDefaultDates() {
     var today = fmtDateInput(new Date());
     $("val-from").value = today;
     $("val-to").value   = today;
+    applyRangeModeUi();
   }
 
   function loadDevices(groupId) {
@@ -1544,59 +1584,79 @@
     if (progress) out.insertBefore(block, progress); else out.appendChild(block);
   }
 
+  function vehicleTotals(dev) {
+    return {
+      km:   dev.days.reduce(function (s, d) { return s + d.distKm; }, 0),
+      idle: dev.days.reduce(function (s, d) { return s + d.idleMins; }, 0),
+      rows: dev.days.reduce(function (s, d) { return s + d.rows.length; }, 0)
+    };
+  }
+
+  function vehicleMetaText(dev, totals) {
+    return dev.days.length + " day" + (dev.days.length === 1 ? "" : "s")
+      + " \u00b7 " + totals.rows.toLocaleString() + " events \u00b7 " + fmtDist(totals.km)
+      + " \u00b7 " + fmtDurWhole(totals.idle) + " idling";
+  }
+
+  function dayMetaText(d) {
+    return eventCount(d) + " \u00b7 " + fmtDist(d.distKm) + " \u00b7 " + fmtDurWhole(d.idleMins) + " idling";
+  }
+
+  function renderDayDetails(dev, d) {
+    var body = "";
+    d.rows.forEach(function (r, i) {
+      var dateCell = i === 0
+        ? "<strong>" + esc(fmtDayShort(d.dayKey)) + "</strong> " + esc(fmtTime(r.t)) + " <span class='val-tz'>" + esc(tzLabel(r.t)) + "</span>"
+        : esc(fmtTime(r.t));
+      var speedCell = r.speed == null || r.speed < IDLE_SPEED_KMH
+        ? "<span class='val-muted'>--</span>"
+        : esc(fmtSpeed(r.speed));
+      var url = replayUrl(dev.id, r.t, r.trip);
+      body += "<tr>"
+        // The "why" tooltip is what makes an uneven row count explainable:
+        // hovering a time says which rule put that row on the page.
+        + "<td class='val-num'" + (r.why ? " title='Shown because: " + esc(r.why) + "'" : "") + ">" + dateCell + "</td>"
+        + "<td><span class='val-status'><span class='val-dot val-dot-" + r.cls + "'></span>" + esc(r.status) + "</span></td>"
+        + "<td class='val-dur'>" + esc(r.duration) + "</td>"
+        + "<td class='val-num'>" + esc(fmtDist(r.distKm)) + "</td>"
+        + "<td class='val-num'>" + speedCell + "</td>"
+        + "<td>" + esc(addressFor(r)) + "</td>"
+        + "<td class='val-coords'>" + r.lat.toFixed(5) + ", " + r.lng.toFixed(5) + "</td>"
+        // A real href, not "#": the browser status bar then shows where the
+        // link goes, and middle-click / copy-link-address both work, which is
+        // what makes this diagnosable without a debugger.
+        + "<td><a href='" + esc(url || "#") + "' target='_blank' rel='noopener' class='val-replay'"
+        + " data-device='" + esc(dev.id) + "' data-time='" + esc(r.t) + "'"
+        + " title='" + esc(url || "No MyGeotab host resolved, so no Trip History link could be built.") + "'>Trip History</a></td>"
+        + "</tr>";
+    });
+
+    return "<details class='val-day-fold'>"
+      + "<summary class='val-day-summary'>"
+      + "<span class='val-day-summary-main'>" + esc(fmtDayReadable(d.dayKey)) + "</span>"
+      + "<span class='val-day-summary-meta'>" + esc(dayMetaText(d)) + "</span>"
+      + "</summary>"
+      + "<div class='val-day-body'>"
+      + idleSplitHtml(d)
+      + "<div class='val-table-wrap'><table class='dd-table'><thead><tr>"
+      + COLS.map(function (c) { return "<th>" + c + "</th>"; }).join("")
+      + "</tr></thead><tbody>" + body + "</tbody></table></div>"
+      + "</div></details>";
+  }
+
   function renderDevice(dev) {
     var block = document.createElement("div");
     block.className = "val-vehicle-block";
 
-    var totalKm   = dev.days.reduce(function (s, d) { return s + d.distKm; }, 0);
-    var totalIdle = dev.days.reduce(function (s, d) { return s + d.idleMins; }, 0);
-    var totalRows = dev.days.reduce(function (s, d) { return s + d.rows.length; }, 0);
-
-    var html = "<h3 class='val-vehicle-name'>" + esc(dev.name) + "</h3>"
-      + "<div class='val-vehicle-meta'>" + dev.days.length + " day" + (dev.days.length === 1 ? "" : "s")
-      + " &middot; " + totalRows.toLocaleString() + " events &middot; " + fmtDist(totalKm)
-      + " &middot; " + fmtDurWhole(totalIdle) + " idling</div>";
-
-    dev.days.forEach(function (d) {
-      var body = "";
-      d.rows.forEach(function (r, i) {
-        var dateCell = i === 0
-          ? "<strong>" + esc(fmtDayShort(d.dayKey)) + "</strong> " + esc(fmtTime(r.t)) + " <span class='val-tz'>" + esc(tzLabel(r.t)) + "</span>"
-          : esc(fmtTime(r.t));
-        var speedCell = r.speed == null || r.speed < IDLE_SPEED_KMH
-          ? "<span class='val-muted'>--</span>"
-          : esc(fmtSpeed(r.speed));
-        var url = replayUrl(dev.id, r.t, r.trip);
-        body += "<tr>"
-          // The "why" tooltip is what makes an uneven row count explainable:
-          // hovering a time says which rule put that row on the page.
-          + "<td class='val-num'" + (r.why ? " title='Shown because: " + esc(r.why) + "'" : "") + ">" + dateCell + "</td>"
-          + "<td><span class='val-status'><span class='val-dot val-dot-" + r.cls + "'></span>" + esc(r.status) + "</span></td>"
-          + "<td class='val-dur'>" + esc(r.duration) + "</td>"
-          + "<td class='val-num'>" + esc(fmtDist(r.distKm)) + "</td>"
-          + "<td class='val-num'>" + speedCell + "</td>"
-          + "<td>" + esc(addressFor(r)) + "</td>"
-          + "<td class='val-coords'>" + r.lat.toFixed(5) + ", " + r.lng.toFixed(5) + "</td>"
-          // A real href, not "#": the browser status bar then shows where the
-          // link goes, and middle-click / copy-link-address both work, which is
-          // what makes this diagnosable without a debugger.
-          + "<td><a href='" + esc(url || "#") + "' target='_blank' rel='noopener' class='val-replay'"
-          + " data-device='" + esc(dev.id) + "' data-time='" + esc(r.t) + "'"
-          + " title='" + esc(url || "No MyGeotab host resolved, so no Trip History link could be built.") + "'>Trip History</a></td>"
-          + "</tr>";
-      });
-
-      body += "<tr class='val-day-total'>"
-        + "<td colspan='3'>" + esc(fmtDayReadable(d.dayKey)) + " total</td>"
-        + "<td class='val-num'>" + esc(fmtDist(d.distKm)) + "</td>"
-        + "<td colspan='4'>" + esc(fmtDurWhole(d.idleMins)) + " idling &middot; " + esc(eventCount(d))
-        + idleSplitHtml(d) + "</td>"
-        + "</tr>";
-
-      html += "<div class='val-table-wrap'><table class='dd-table'><thead><tr>"
-        + COLS.map(function (c) { return "<th>" + c + "</th>"; }).join("")
-        + "</tr></thead><tbody>" + body + "</tbody></table></div>";
-    });
+    var totals = vehicleTotals(dev);
+    var html = "<details class='val-vehicle-fold'>"
+      + "<summary class='val-vehicle-summary'>"
+      + "<span class='val-vehicle-summary-main'>" + esc(dev.name) + "</span>"
+      + "<span class='val-vehicle-summary-meta'>" + esc(vehicleMetaText(dev, totals)) + "</span>"
+      + "</summary>"
+      + "<div class='val-vehicle-body'>"
+      + dev.days.map(function (d) { return renderDayDetails(dev, d); }).join("")
+      + "</div></details>";
 
     block.innerHTML = html;
 
@@ -1617,11 +1677,8 @@
 
   // There is deliberately no fleet-wide summary here (removed v1.7.0). It totalled
   // distance, idling and events across every vehicle in the run, which is a fleet
-  // question this report does not answer. The per-vehicle line above each table
-  // ("1 day · 106 events · 30.83 km · 5m idling") carries the same measures scoped
-  // to the vehicle they describe. The summary was also screen-only, so nothing in
-  // it could be cited from the PDF or CSV, and it was not in the report this one
-  // recreates. Fleet aggregates belong in Smart Insights.
+  // question this report does not answer. The per-vehicle fold header carries the
+  // same measures scoped to the vehicle it describes.
 
   // ─── Exports ─────────────────────────────────────────────────────────────
   function flatRows() {
@@ -1653,6 +1710,91 @@
     if (!S.devices.length) { alert("Run the report first."); return; }
     var rows = [CSV_HEAD].concat(flatRows());
     downloadCsvBlob(rows, "vehicle_activity_log_" + $("val-from").value + "_to_" + $("val-to").value + ".csv");
+  }
+
+  function excelRowsSingleSheet() {
+    var rows = [];
+    var links = [];
+
+    rows.push(["Vehicle Activity Log"]);
+    rows.push([$("val-from").value + " to " + $("val-to").value, S.dbName || ""]);
+    rows.push([]);
+
+    S.devices.forEach(function (dev, di) {
+      var totals = vehicleTotals(dev);
+      rows.push([dev.name, vehicleMetaText(dev, totals)]);
+
+      dev.days.forEach(function (d) {
+        rows.push([fmtDayReadable(d.dayKey), dayMetaText(d)]);
+        var split = idleSplitText(d);
+        if (split) rows.push([split]);
+        rows.push(COLS.slice());
+
+        d.rows.forEach(function (r, i) {
+          var url = replayUrl(dev.id, r.t, r.trip);
+          var outRow = [
+            i === 0
+              ? (fmtDayShort(d.dayKey) + " " + fmtTime(r.t) + " " + tzLabel(r.t)).trim()
+              : fmtTime(r.t),
+            r.status,
+            r.duration,
+            fmtDist(r.distKm),
+            (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : fmtSpeed(r.speed),
+            addressFor(r),
+            r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
+            url ? "Trip History" : ""
+          ];
+          var rowIndex = rows.length;
+          rows.push(outRow);
+          if (url) links.push({ r: rowIndex, c: 7, url: url });
+        });
+
+        rows.push([
+          "Day total",
+          "",
+          fmtDurWhole(d.idleMins) + " idling",
+          fmtDist(d.distKm),
+          "",
+          eventCount(d),
+          "",
+          ""
+        ]);
+        rows.push([]);
+      });
+
+      if (di < S.devices.length - 1) rows.push([]);
+    });
+
+    return { rows: rows, links: links };
+  }
+
+  function exportExcel() {
+    if (!S.devices.length) { alert("Run the report first."); return; }
+    if (typeof XLSX === "undefined") {
+      alert("Excel export is unavailable because the workbook library did not load.");
+      return;
+    }
+
+    var built = excelRowsSingleSheet();
+    var sheet = XLSX.utils.aoa_to_sheet(built.rows);
+
+    built.links.forEach(function (h) {
+      var addr = XLSX.utils.encode_cell({ r: h.r, c: h.c });
+      if (!sheet[addr]) sheet[addr] = { t: "s", v: "Trip History" };
+      sheet[addr].l = { Target: h.url, Tooltip: "Open in MyGeotab Trip History" };
+    });
+
+    sheet["!cols"] = [
+      { wch: 26 }, { wch: 26 }, { wch: 22 }, { wch: 17 },
+      { wch: 14 }, { wch: 48 }, { wch: 24 }, { wch: 18 }
+    ];
+
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, sheet, "Activity Log");
+    XLSX.writeFile(wb,
+      "vehicle_activity_log_" + $("val-from").value + "_to_" + $("val-to").value + ".xlsx",
+      { compression: true }
+    );
   }
 
   function drawPdfHeaderLogo(doc, pageW, margin, barH) {
@@ -1785,6 +1927,9 @@
   function runReport() {
     if (S.running) return;
 
+    // Keep from/to aligned with the selected preset before validation and fetch.
+    applyRangeModeUi();
+
     var from = $("val-from").value;
     var to   = $("val-to").value;
     if (!from || !to) { alert("Pick a from and to date."); return; }
@@ -1815,6 +1960,7 @@
     }
     renderLinkInfo();
     renderWarnings();
+    $("val-xlsx").classList.add("hidden");
     $("val-csv").classList.add("hidden");
     $("val-pdf").classList.add("hidden");
     $("val-run").disabled = true;
@@ -1843,8 +1989,9 @@
             finish("No activity found for that selection and date range.");
             return;
           }
-          // Nothing to put in a CSV or a PDF if every vehicle was parked.
+          // Nothing to export if every vehicle was parked.
           if (S.devices.length) {
+            $("val-xlsx").classList.remove("hidden");
             $("val-csv").classList.remove("hidden");
             $("val-pdf").classList.remove("hidden");
           }
@@ -1959,13 +2106,29 @@
   function setup() {
     applyDefaultDates();
 
-    $("val-from").addEventListener("change", function () { S.datesTouched = true; });
-    $("val-to").addEventListener("change",   function () { S.datesTouched = true; });
+    var range = $("val-range");
+    if (range) {
+      range.addEventListener("change", function () {
+        S.datesTouched = true;
+        applyRangeModeUi();
+      });
+    }
+
+    $("val-from").addEventListener("change", function () {
+      S.datesTouched = true;
+      syncToDateFromFromDate();
+    });
+    $("val-to").addEventListener("change", function () {
+      S.datesTouched = true;
+      if (selectedRangeMode() !== "custom") syncToDateFromFromDate();
+    });
     $("val-group").addEventListener("change", function () { loadDevices(this.value); });
     $("val-run").addEventListener("click", runReport);
+    $("val-xlsx").addEventListener("click", exportExcel);
     $("val-csv").addEventListener("click", exportCsv);
     $("val-pdf").addEventListener("click", exportPdf);
 
+    applyRangeModeUi();
     loadGroups();
     loadDevices("");
   }
