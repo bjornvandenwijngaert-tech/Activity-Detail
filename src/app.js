@@ -1627,7 +1627,7 @@
         // what makes this diagnosable without a debugger.
         + "<td><a href='" + esc(url || "#") + "' target='_blank' rel='noopener' class='val-replay'"
         + " data-device='" + esc(dev.id) + "' data-time='" + esc(r.t) + "'"
-        + " title='" + esc(url || "No MyGeotab host resolved, so no Trip History link could be built.") + "'>Trip History</a></td>"
+        + " title='" + esc(url || "No MyGeotab host resolved, so no Trip History link could be built.") + "'>Map</a></td>"
         + "</tr>";
     });
 
@@ -1742,7 +1742,7 @@
             (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : fmtSpeed(r.speed),
             addressFor(r),
             r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
-            url ? "Trip History" : ""
+            url ? "Map" : ""
           ];
           var rowIndex = rows.length;
           rows.push(outRow);
@@ -1780,7 +1780,7 @@
 
     built.links.forEach(function (h) {
       var addr = XLSX.utils.encode_cell({ r: h.r, c: h.c });
-      if (!sheet[addr]) sheet[addr] = { t: "s", v: "Trip History" };
+      if (!sheet[addr]) sheet[addr] = { t: "s", v: "Map" };
       sheet[addr].l = { Target: h.url, Tooltip: "Open in MyGeotab Trip History" };
     });
 
@@ -1847,7 +1847,7 @@
             fmtTime(r.t), r.status, r.duration, fmtDist(r.distKm),
             (r.speed == null || r.speed < IDLE_SPEED_KMH) ? "--" : fmtSpeed(r.speed),
             addressFor(r), r.lat.toFixed(5) + ", " + r.lng.toFixed(5),
-            rUrl ? "Trip History" : ""
+            rUrl ? "Map" : ""
           ]);
           pdfUrls.push(rUrl);
           emitted++;

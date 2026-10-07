@@ -11,8 +11,9 @@ Reference columns, in order:
 
 `DATE | STATUS | DURATION | DAILY DISTANCE | SPEED | LOCATION | COORDINATES | REPLAY`
 
-The last column is labelled **Trip History** here, not REPLAY. That is the one
-deliberate difference from the reference export: see the naming note below.
+The last column is labelled **Trip History** here, not REPLAY. Its clickable text
+is **Map** (v1.9.1). The heading is the deliberate difference from the reference
+export: see the naming note below.
 
 Statuses: Ignition on, Idling start, Idling, Idling end, Moving, Ignition off.
 
@@ -732,10 +733,12 @@ header, and the PDF header and cell. The internal names (`replayUrl`,
 mechanism, which is still the replay player, and renaming them would be churn
 across the one part of this file that took four versions to get right.
 
-The cell text reads `Trip History`, in the same case as its column header, not
-the all-caps `REPLAY` the reference export uses. The `.4px` tracking on
-`.val-replay` went with it: that was there to open up the capitals and only
-loosens mixed case.
+In v1.9.1 the clickable text changed to `Map` on screen and in Excel and PDF;
+the column heading stays `Trip History`, and CSV still contains the raw URL.
+Previously the cell text read `Trip History`, in the same case as its column
+header, not the all-caps `REPLAY` the reference export uses. The `.4px` tracking
+on `.val-replay` went with that earlier rename: it was there to open up the
+capitals and only loosens mixed case.
 
 PDF column 7 went from 16 mm to 21 mm. `Trip History` at 7.5pt bold measures
 14.9 mm, so 18.1 mm is the true minimum with the 1.6 mm padding either side;
